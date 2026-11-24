@@ -58,6 +58,8 @@ nonisolated struct DiffItem: Sendable, Identifiable {
     var suggested: Decision
     var allowed: [Decision]
     var reason: String
+    /// Choice -> never-synced versions it would send to the Trash.
+    var retires: [String: [String]] = [:]
 
     static func fileID(_ key: String) -> String { "f:" + key }
     static func folderID(_ key: String) -> String { "d:" + key }

@@ -208,6 +208,7 @@ final class AppModel {
         if s.mergeMode { why.append("there is no matching record of an earlier sync, so nothing is treated as deleted") }
         if s.deletions > 0 { why.append("something would be deleted") }
         if s.clashes > 0 { why.append("a file was edited on both drives") }
+        if s.toConfirm > 0 { why.append("version 1.0 made the last sync, so deletions need your OK this once") }
         if why.isEmpty { why.append("many old versions would go to the Trash") }
         addLog("Sync paused for review. Nothing has been changed.", .warning)
         comparison = Comparison(pair: pair, plan: plan,
@@ -275,7 +276,7 @@ final class AppModel {
             try? PairStore.save(pairs)
         }
         let summary = "Copied \(result.copied) file(s) (\(Fmt.bytes(result.bytesCopied))), \(result.trashed) item(s) to Trash."
-        let left = plan.summary.skipped + plan.summary.clashes + plan.summary.heldBack
+        let left = plan.summary.skipped + plan.summary.clashes + plan.summary.heldBack + plan.summary.conflicts + result.kept
         if result.errors > 0 {
             addLog("Sync finished with \(result.errors) error(s). \(summary) Problem items were left as they were; run Sync again after fixing them.", .error)
         } else if plan.partial {

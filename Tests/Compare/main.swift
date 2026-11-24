@@ -314,5 +314,38 @@ if (try! fm.contentsOfDirectory(atPath: B.path)).filter({ $0.lowercased() == "ab
     check(kind(look(), "f:ab.txt") == .blocked, "shown as left alone")
 } else { print("  (skipped: this drive ignores capitals)") }
 
+// ---- Second review ----
+fresh("S1 keep older interrupted on B"); w(A, "r.txt", "old", 9000); doSync(); w(B, "r.txt", "newer edit", 500)
+let s1 = SyncEngine.review(of: look()); var s1r = s1; s1r.decisions["f:r.txt"] = .keepA
+do { let e = eng(); let p = try! e.prepare(review: s1r); _ = p
+    // The state a crash leaves: A done, B renamed but the older copy not yet in place, choice already recorded.
+    e.releaseLocks() }
+w(A, "r_past.txt", "newer edit", 500); mv(B, "r.txt", "r_past.txt")
+for d in [A, B] { let f = try! fm.contentsOfDirectory(atPath: d.path).first { $0.hasPrefix(".projectdrivesync-") }!
+    var st = try! JSONDecoder().decode(SyncState.self, from: Data(contentsOf: d.appendingPathComponent(f)))
+    let at = try! fm.attributesOfItem(atPath: A.appendingPathComponent("r_past.txt").path)
+    st.demoted = ["r.txt": VersionStamp(size: at[.size] as! Int64, mtime: at[.modificationDate] as! Date)]
+    try! JSONEncoder().encode(st).write(to: d.appendingPathComponent(f)) }
+s = doSync(); check(s.deletions == 0 && trashEmpty(), "nothing deleted"); doSync(); check(rd(B, "r.txt") != nil && (rd(B, "r_past.txt") == "newer edit" || rd(B, "r.txt") == "newer edit"), "both versions kept"); check(settled(), "settled")
+fresh("S2 keep older, only one drive done"); w(A, "r.txt", "p0", 9900); doSync(); w(A, "r.txt", "old", 9000); doSync(); w(A, "r.txt", "newer edit", 500)
+lock(B.appendingPathComponent("r_past.txt"), true); apply(look(), ["f:r.txt": .keepB]); lock(B.appendingPathComponent("r_past.txt"), false); doSync(); doSync()
+check(!(trashed("newer edit") && rd(A, "r_past.txt") != "newer edit" && rd(A, "r.txt") != "newer edit"), "the edit is still on the drives"); check(settled(), "settled")
+fresh("S3 no record: a newest _past edit isn't retired"); w(A, "k.txt", "k", 9000); doSync(); w(A, "r.txt", "a1", 600); w(A, "r_past.txt", "b1", 700); w(B, "r.txt", "b1", 700); w(B, "r_past.txt", "B past edit", 100); doSync()
+check(rd(B, "r_past.txt") == "B past edit" && trashEmpty(), "asked instead")
+fresh("S4 a choice that retires an edit names it"); w(A, "r.txt", "A cur", 500); w(A, "r_past.txt", "A past!", 100); w(B, "r.txt", "B cur!!", 400); w(B, "r_past.txt", "B past!!!", 50); p = look()
+check(p.items.first { $0.id == "f:r.txt" }!.retires["keepA"]?.isEmpty == false , "listed")
+fresh("S5 reverting with the _past is asked about, not undone"); v12(); rm(B, "r.txt"); try! fm.copyItem(at: B.appendingPathComponent("r_past.txt"), to: B.appendingPathComponent("r.txt")); s = doSync()
+check(rd(B, "r.txt") == "v1" && s.clashes == 1, "left as the user made it"); apply(look(), ["f:r.txt": .keepB]); check(rd(A, "r.txt") == "v1" && settled(), "and can be chosen")
+fresh("S6 one stuck file doesn't stop other deletions"); w(A, "r.txt", "r", 9000); w(A, "d.txt", "dd", 9000); doSync(); w(A, "r.txt", "r2", 500); lock(B.appendingPathComponent("r.txt"), true); rm(A, "d.txt"); doSync()
+check(!ex(B, "d.txt") && rd(B, "r.txt") == "r", "unrelated deletion done, locked file left"); lock(B.appendingPathComponent("r.txt"), false); doSync(); check(settled(), "settled")
+fresh("S7 first pairing with different _past files is a choice, not a dead end"); w(A, "r.txt", "same", 9000); w(B, "r.txt", "same", 9000); let t7 = try! fm.attributesOfItem(atPath: A.appendingPathComponent("r.txt").path)[.modificationDate]!
+try! fm.setAttributes([.modificationDate: t7], ofItemAtPath: B.appendingPathComponent("r.txt").path); w(A, "r_past.txt", "pa", 9500); w(B, "r_past.txt", "pb!", 9400); doSync(); doSync(); p = look()
+check(kind(p, "f:r.txt") == .clash && trashEmpty(), "asks"); apply(p, ["f:r.txt": .keepA]); check(rd(B, "r_past.txt") == "pa" && settled(), "chosen and settled")
+fresh("S8 document beside a folder named like its _past"); w(A, "Budget", "b", 9000); w(A, "Budget_past/in.txt", "in", 9000); doSync(); w(A, "Budget_past/in.txt", "in2", 100); doSync(); check(rd(B, "Budget_past/in.txt") == "in2", "the folder still syncs")
+fresh("S9 a document's versions are deleted together or not at all"); v12(); rm(B, "r.txt"); lock(A.appendingPathComponent("r_past.txt"), true); doSync(); check(rd(A, "r.txt") == "v2" && rd(A, "r_past.txt") == "v1", "put back"); lock(A.appendingPathComponent("r_past.txt"), false); doSync(); check(!ex(A, "r.txt") && !ex(A, "r_past.txt"), "then deleted")
+fresh("S10 same size, saved within two seconds"); w(A, "r.txt", "base", 9000); doSync(); w(A, "r.txt", "1111", 500.0); w(B, "r.txt", "2222", 499.2); check(kind(look(), "f:r.txt") == .clash, "seen as different edits")
+fresh("S11 keep both survives stopping half-way"); w(A, "r.txt", "base", 9000); doSync(); w(A, "r.txt", "A edit", 600); w(B, "r.txt", "B edit!", 500); mv(A, "r.txt", ".pds-hold-r.txt"); w(B, "r (X).txt", "A edit", 600)
+check(kind(look(), "f:r.txt") == .blocked, "looking explains"); doSync(); check(rd(A, "r.txt") == "A edit" && rd(B, "r.txt") == "B edit!" && rd(A, "r (X).txt") == "A edit", "restored")
+
 print(failures == 0 ? "\nALL PASSED (\(passes))" : "\n\(failures) FAILURE(S)")
 exit(failures == 0 ? 0 : 1)

@@ -103,8 +103,10 @@ final class Comparison {
         guard let item = items[id] else { return }
         if item.allowed.contains(d) { decisions[id] = d }
         if item.isFolder {
-            let prefix = item.key + "/"
-            for child in items.values where child.key.hasPrefix(prefix) && child.allowed.contains(d) { decisions[child.id] = d }
+            let inside = contents(of: item)
+            // With a search or the Review filter on, only what is visible is affected, so the folder itself stays.
+            if narrowed && d == .deleteBoth { decisions[item.id] = item.allowed.isEmpty ? nil : .skip }
+            for child in inside where child.allowed.contains(d) && !(narrowed && child.isFolder && d == .deleteBoth) { decisions[child.id] = d }
         }
         if d != .deleteBoth {
             // A folder can't be deleted while something inside it stays.
@@ -118,6 +120,15 @@ final class Comparison {
         recount()
     }
 
+    /// True while the tree hides items that have changes.
+    var narrowed: Bool { !search.isEmpty || filter == .review }
+
+    private func contents(of folder: DiffItem) -> [DiffItem] {
+        let prefix = folder.key + "/"
+        let visible = narrowed ? Set(rows.map(\.id)) : []
+        return items.values.filter { $0.key.hasPrefix(prefix) && (!narrowed || visible.contains($0.id)) }
+    }
+
     func set(_ d: Decision, for ids: Set<String>) { for id in ids { set(d, for: id) } }
 
     func reset() { decisions = [:]; recount() }
@@ -129,8 +140,7 @@ final class Comparison {
             guard let item = items[id] else { continue }
             var here = Set(item.allowed)
             if item.isFolder && here.isEmpty {
-                let prefix = item.key + "/"
-                for c in items.values where c.key.hasPrefix(prefix) { here.formUnion(c.allowed) }
+                for c in contents(of: item) { here.formUnion(c.allowed) }
             }
             result = result.map { $0.intersection(here) } ?? here
         }
@@ -143,8 +153,7 @@ final class Comparison {
         var out = ids
         for id in ids {
             guard let item = items[id], item.isFolder else { continue }
-            let prefix = item.key + "/"
-            for c in items.values where c.key.hasPrefix(prefix) { out.insert(c.id) }
+            for c in contents(of: item) { out.insert(c.id) }
         }
         return out
     }
@@ -162,6 +171,7 @@ final class Comparison {
             if let limit, !limit.contains(item.id) { continue }
             if item.kind == .blocked { t.blocked += 1; continue }
             if isUnchosen(item) { t.choose += 1; continue }
+            t.trashNames += item.retires[decision(item).rawValue] ?? []
             let sa = item.a?.size ?? 0, sb = item.b?.size ?? 0
             switch decision(item) {
             case .skip: if !item.isFolder { t.skipped += 1 }

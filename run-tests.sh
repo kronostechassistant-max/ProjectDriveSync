@@ -14,4 +14,9 @@ for suite in Engine Compare Model; do
   grep -E "^==|  FAIL" "$WORK/$suite.txt" | grep -B1 "  FAIL" || true
   tail -1 "$WORK/$suite.txt"
 done
+# Random use with cancels and crashes (seed from the clock; a failure prints its seed).
+xcrun swiftc -swift-version 5 -default-isolation MainActor -O -suppress-warnings \
+  ProjectDriveSync/{Models,Compare,SyncEngine}.swift Tests/Fuzz/main.swift -o "$WORK/Fuzz"
+"$WORK/Fuzz" "$WORK/run-Fuzz" "${1:-60}" "$RANDOM" > "$WORK/Fuzz.txt" || rc=1
+echo "Fuzz: $(grep -E 'FAIL|PASSED' "$WORK/Fuzz.txt" | head -1)"
 exit $rc

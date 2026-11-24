@@ -44,7 +44,7 @@ struct CompareView: View {
     private static func trashMessage(_ t: Comparison.Totals) -> String {
         let shown = t.trashNames.prefix(12).joined(separator: "\n")
         let more = t.trashNames.count > 12 ? "\n…and \(t.trashNames.count - 12) more" : ""
-        return "These go to the Trash, with their _past versions, wherever they are:\n\n\(shown)\(more)"
+        return "These go to the Trash (a deleted document takes its _past file with it):\n\n\(shown)\(more)"
     }
 
     private func requestApply(limit: Set<String>? = nil) {
@@ -123,7 +123,8 @@ struct CompareView: View {
     @ViewBuilder private func menu(for ids: Set<String>) -> some View {
         let single = ids.count == 1 ? ids.first.flatMap { comparison.items[$0] } : nil
         ForEach(comparison.allowed(for: ids), id: \.self) { d in
-            Button(comparison.title(d, single)) { comparison.set(d, for: ids) }
+            Button(comparison.title(d, single) + (single?.retires[d.rawValue] == nil ? "" : " (an edit goes to the Trash)")) { comparison.set(d, for: ids) }
+                .disabled(model.isBusy)
         }
         Divider()
         Button("Do This Now") { requestApply(limit: comparison.scope(ids)) }
@@ -203,7 +204,8 @@ struct CompareView: View {
             Menu {
                 ForEach(item.allowed, id: \.self) { option in
                     Button { comparison.set(option, for: item.id) } label: {
-                        Label(comparison.title(option, item) + (option == item.suggested && item.kind != .clash && item.kind != .olderCopy ? "  (suggested)" : ""),
+                        Label(comparison.title(option, item) + (option == item.suggested && item.kind != .clash && item.kind != .olderCopy ? "  (suggested)" : "")
+                              + (item.retires[option.rawValue] == nil ? "" : "  (an edit goes to the Trash)"),
                               systemImage: comparison.symbol(option, item))
                     }
                 }
@@ -348,6 +350,8 @@ struct ReviewSheet: View {
                         Button { comparison.set(d, for: item.id); dismiss() } label: {
                             Label(comparison.title(d, item), systemImage: comparison.symbol(d, item))
                         }
+                        .disabled(model.isBusy)
+                        .help(item.retires[d.rawValue].map { "Sends to the Trash: " + $0.joined(separator: ", ") } ?? "")
                     }
                 }
                 Spacer()
