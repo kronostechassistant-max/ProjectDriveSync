@@ -142,6 +142,8 @@ nonisolated struct SideScan: Sendable {
     /// Folders that could not be read. While any exist, nothing is deleted anywhere.
     var unreadable: [String] = []
     var recovered: [String] = []
+    /// Documents with a file still parked by an interrupted sync (seen by a read-only check).
+    var parkedKeys: Set<String> = []
     var totalBytes: Int64 = 0
     var fileCount = 0
 }
@@ -160,6 +162,8 @@ nonisolated struct SyncState: Codable, Sendable {
     /// logical file key -> newest version at the last sync
     var files: [String: VersionStamp]
     var folders: [String]
+    /// A _past version the user chose to keep behind an older current one, although its date is newer.
+    var demoted: [String: VersionStamp]? = nil
 }
 
 // MARK: - Plan model
@@ -222,25 +226,28 @@ nonisolated struct PlanSummary: Sendable {
     var unchanged = 0
     var keptChanged = 0
     var conflicts = 0
+    var clashes = 0
+    var skipped = 0
+    var heldBack = 0
+    var keepBoth = 0
     var unreadable = 0
     var deletionsPaused = false
     var totalDocuments = 0
 
     var deletions: Int { filesToDelete + foldersToDelete }
-    var isNoop: Bool { foldersToCreate == 0 && filesToCopy == 0 && versionUpdates == 0 && deletions == 0 }
+    var isNoop: Bool { foldersToCreate == 0 && filesToCopy == 0 && versionUpdates == 0 && deletions == 0 && keepBoth == 0 }
 
-    /// Ask before running when it's the first sync of a pair, or when lots would be deleted.
+    /// Show the comparison before running: first sync, any deletion, any clash, or many old versions retired.
     var needsConfirmation: Bool {
         if mergeMode && !isNoop { return true }
-        if deletions >= 25 || displacedVersions >= 25 { return true }
-        let docs = max(totalDocuments, 1)
-        return (deletions > 0 && deletions * 5 >= docs) || (displacedVersions > 0 && displacedVersions * 5 >= docs)
+        if deletions > 0 || clashes > 0 || displacedVersions >= 25 { return true }
+        return displacedVersions >= 5 && displacedVersions * 5 >= max(totalDocuments, 1)
     }
 
     var lines: [String] {
         var l: [String] = []
         if mergeMode {
-            l.append("First sync for this pair (or the last-sync records didn't match): safe merge mode. Nothing will be deleted. Both folders end up with everything from either one.")
+            l.append("First sync for this pair (or the last-sync records didn't match): safe merge mode. No document or folder will be deleted.")
         }
         if foldersToCreate > 0 { l.append("\(foldersToCreate) folder(s) will be created.") }
         if filesToCopy > 0 { l.append("\(filesToCopy) file copies, \(Fmt.bytes(bytesToCopy)) total.") }
@@ -249,6 +256,10 @@ nonisolated struct PlanSummary: Sendable {
             l.append("\(filesToDelete) document(s) and \(foldersToDelete) folder(s) that were deleted in one location since the last sync will be moved to the Trash in the other.")
         }
         if keptChanged > 0 { l.append("\(keptChanged) item(s) deleted in one location but changed in the other will be kept and restored.") }
+        if clashes > 0 { l.append("\(clashes) document(s) were edited on both drives. They are left alone until you choose what to keep.") }
+        if keepBoth > 0 { l.append("\(keepBoth) document(s) will be kept as two separate files.") }
+        if skipped > 0 { l.append("\(skipped) item(s) skipped this time.") }
+        if heldBack > 0 { l.append("\(heldBack) item(s) changed after you looked, so they are held back. Compare again to see them.") }
         if conflicts > 0 { l.append("\(conflicts) item(s) will be skipped because of a name problem (see log).") }
         if unreadable > 0 { l.append("\(unreadable) item(s) couldn't be read\(deletionsPaused ? ", so no deletions will be carried over this time" : "").") }
         l.append("\(unchanged) document(s) are already up to date.")
@@ -262,6 +273,12 @@ nonisolated struct SyncPlan: Sendable {
     var folderCreates: [FolderCreate] = []
     var fileGroups: [[FileOp]] = []
     var deletes: [DeleteOp] = []
+    var keepBoths: [KeepBothOp] = []
+    var items: [DiffItem] = []
+    /// Newer versions the user chose to put behind an older current one (document key -> stamp).
+    var demote: [String: VersionStamp] = [:]
+    /// "Do this now" touches only some items.
+    var partial = false
     var summary = PlanSummary()
     var notes: [String] = []
 }
@@ -455,15 +472,15 @@ nonisolated final class SyncEngine: @unchecked Sendable {
         return k.hasPrefix(Naming.key(rootName + SyncConstants.structureMarker)) && k.hasSuffix(".txt")
     }
 
-    func scan(_ side: Side) throws -> SideScan {
+    func scan(_ side: Side, readOnly: Bool = false) throws -> SideScan {
         let rootURL = root(side)
         guard PairStore.isDirectory(rootURL.path) else { throw SyncError.locationMissing(rootURL.path) }
         var result = SideScan(root: rootURL)
-        try walk(dir: rootURL, rel: "", depth: 0, rootName: rootURL.lastPathComponent, into: &result)
+        try walk(dir: rootURL, rel: "", depth: 0, rootName: rootURL.lastPathComponent, readOnly: readOnly, into: &result)
         return result
     }
 
-    private func walk(dir: URL, rel: String, depth: Int, rootName: String, into result: inout SideScan) throws {
+    private func walk(dir: URL, rel: String, depth: Int, rootName: String, readOnly: Bool, into result: inout SideScan) throws {
         try checkCancel()
         var items: [URL]
         do {
@@ -479,6 +496,14 @@ nonisolated final class SyncEngine: @unchecked Sendable {
         var touched = false
         for item in items {
             let name = item.lastPathComponent
+            if readOnly {
+                if name.hasPrefix(SyncConstants.holdPrefix) {
+                    var original = name
+                    while original.hasPrefix(SyncConstants.holdPrefix) { original.removeFirst(SyncConstants.holdPrefix.count) }
+                    result.parkedKeys.insert(Naming.joinPath(Naming.key(rel), Naming.key(Naming.parse(original).logical)))
+                }
+                continue
+            }
             if name.hasPrefix(SyncConstants.tempPrefix) {
                 try? fm.removeItem(at: item)
                 touched = true
@@ -527,7 +552,7 @@ nonisolated final class SyncEngine: @unchecked Sendable {
             let isPackage = isDir && values.isPackage == true
             if isDir && !isPackage {
                 result.folders[Naming.key(childRel)] = childRel
-                try walk(dir: item, rel: childRel, depth: depth + 1, rootName: rootName, into: &result)
+                try walk(dir: item, rel: childRel, depth: depth + 1, rootName: rootName, readOnly: readOnly, into: &result)
                 continue
             }
             var size = Int64(values.fileSize ?? 0)
@@ -581,15 +606,16 @@ nonisolated final class SyncEngine: @unchecked Sendable {
 
     // MARK: - Prepare (scan + plan)
 
-    func prepare() throws -> SyncPlan {
+    /// `readOnly` only looks: nothing on either drive is touched.
+    func prepare(readOnly: Bool = false, review: Review? = nil) throws -> SyncPlan {
         progress = SyncProgress()
         setPhase("Scanning location A…", indeterminate: true)
         log("Scanning A: \(root(.a).path)")
-        let scanA = try scan(.a)
+        let scanA = try scan(.a, readOnly: readOnly)
         try checkCancel()
         setPhase("Scanning location B…", indeterminate: true)
         log("Scanning B: \(root(.b).path)")
-        let scanB = try scan(.b)
+        let scanB = try scan(.b, readOnly: readOnly)
         for (side, s) in [(Side.a, scanA), (Side.b, scanB)] {
             log("\(sideName(side)) \(s.folders.count) folders, \(s.fileCount) files, \(Fmt.bytes(s.totalBytes))")
             for r in s.recovered { log("\(sideName(side)) Restored a file left over from an interrupted sync: \(r)", .warning) }
@@ -610,7 +636,10 @@ nonisolated final class SyncEngine: @unchecked Sendable {
         }
 
         setPhase("Planning…", indeterminate: true)
-        var plan = buildPlan(scans: [scanA, scanB], state: trusted)
+        if let review, review.syncID != trusted?.syncID {
+            throw SyncError.failed("This pair was synced after you compared it, so nothing was changed. Compare again.")
+        }
+        var plan = buildPlan(scans: [scanA, scanB], state: trusted, review: review)
         plan.summary.pairName = pair.name
         for note in plan.notes.prefix(30) { log(note, .warning) }
         if plan.notes.count > 30 { log("…and \(plan.notes.count - 30) more notes (see full log)", .warning) }
@@ -625,7 +654,7 @@ nonisolated final class SyncEngine: @unchecked Sendable {
         var instances: [(side: Side, variant: FileVariant)]
     }
 
-    private func groupVersions(_ instances: [(side: Side, variant: FileVariant)]) -> [Version] {
+    private func groupVersions(_ instances: [(side: Side, variant: FileVariant)], demoted: VersionStamp? = nil) -> [Version] {
         var versions: [Version] = []
         for inst in instances.sorted(by: { $0.variant.mtime > $1.variant.mtime }) {
             if let i = versions.firstIndex(where: { $0.rep.sameVersion(as: inst.variant) }) {
@@ -635,159 +664,386 @@ nonisolated final class SyncEngine: @unchecked Sendable {
             }
         }
         versions.sort { $0.rep.mtime != $1.rep.mtime ? $0.rep.mtime > $1.rep.mtime : $0.rep.size > $1.rep.size }
+        if let demoted {
+            // The user put this version behind an older one; it stays behind while it is only a _past file.
+            let isDemoted: (Version) -> Bool = { v in
+                v.rep.matches(demoted) && v.instances.allSatisfy { $0.variant.role == .past }
+            }
+            versions = versions.filter { !isDemoted($0) } + versions.filter(isDemoted)
+        }
         return versions
     }
 
-    func buildPlan(scans: [SideScan], state: SyncState?) -> SyncPlan {
+    /// Decides what every document and folder needs, and why. The comparison tree and the sync are both
+    /// built from this one result, so they can't disagree.
+    func buildPlan(scans: [SideScan], state: SyncState?, review: Review? = nil) -> SyncPlan {
         var plan = SyncPlan(scans: scans, oldState: state)
+        plan.partial = review?.limit != nil
         plan.summary.mergeMode = (state == nil)
         plan.summary.unreadable = scans.reduce(0) { $0 + $1.unreadable.count }
         // If anything couldn't be read, a missing item might just be unreadable: delete nothing this time.
-        let deletionState: SyncState? = plan.summary.unreadable == 0 ? state : nil
-        if state != nil && deletionState == nil {
+        let canDelete = plan.summary.unreadable == 0
+        if state != nil && !canDelete {
             plan.summary.deletionsPaused = true
-            plan.notes.append("Some items couldn't be read (see errors), so no deletions are carried over this time. Fix the problem and sync again.")
+            plan.notes.append("Some items couldn't be read (see errors), so nothing is deleted this time. Fix the problem and sync again.")
         }
-        let stateFolders = Set(deletionState?.folders ?? [])
+        let stateFolders = Set(state?.folders ?? [])
+        let unreadableKeys = Set(scans.flatMap(\.unreadable).map(Naming.key))
+        let parked = scans[0].parkedKeys.union(scans[1].parkedKeys)
+        let labels = Place.labels(pair)
+        func label(_ s: Side) -> String { s == .a ? labels.a : labels.b }
+        func underUnreadable(_ key: String) -> Bool {
+            !unreadableKeys.isEmpty && (unreadableKeys.contains(key) || Naming.ancestors(of: key).contains { unreadableKeys.contains($0) })
+        }
+        /// The user's choice if it is one this item allows, otherwise the suggestion.
+        func choice(_ id: String, _ suggested: Decision, _ allowed: [Decision]) -> Decision {
+            if let limit = review?.limit, !limit.contains(id) { return .skip }
+            guard let d = review?.decisions[id] else { return suggested }
+            return allowed.contains(d) ? d : .skip
+        }
+        func info(_ f: LogicalFile?) -> SideInfo? {
+            guard let f else { return nil }
+            let c = Self.current(f)
+            let past = f.variants.filter { $0.role == .past && $0.relPath != c.relPath }.max { $0.mtime < $1.mtime }
+            return SideInfo(relPath: c.relPath, size: c.size, mtime: c.mtime, isPackage: c.isPackage,
+                            pastRelPath: past?.relPath, pastMtime: past?.mtime)
+        }
 
         // ---- Files ----
         let allFileKeys = Set(scans[0].files.keys).union(scans[1].files.keys)
         plan.summary.totalDocuments = allFileKeys.count
         var deletedFileKeys = Set<String>()
+        /// Documents whose plan copies something to a side (that side needs the parent folders).
+        var copiesTo: [String: Set<Side>] = [:]
         var pendingFileDeletes: [(key: String, side: Side, variants: [FileVariant])] = []
         var conflictKeys = Set<String>()
+        var claimedNames = Set<String>()
 
         for key in allFileKeys.sorted() {
             let fa = scans[0].files[key], fb = scans[1].files[key]
-            let anyFile = (fa ?? fb)!
-            // A file whose name (or its _past name) matches a folder in either location.
-            let targetKeys = [key] + [VersionRole.past].map {
-                Naming.joinPath(anyFile.parentKey, Naming.key(Naming.name(logical: anyFile.logicalName, role: $0)))
+            let lf = (fa ?? fb)!
+            let id = DiffItem.fileID(key)
+            let shownPath = Naming.joinPath(lf.parentRel, lf.logicalName)
+            var item = DiffItem(id: id, key: key, parentKey: lf.parentKey, name: Naming.lastComponent(Self.current(lf).relPath),
+                                isFolder: false, kind: .unchanged, side: nil, a: info(fa), b: info(fb),
+                                suggested: .skip, allowed: [], reason: "The same on both drives.")
+
+            func block(_ reason: String) {
+                item.kind = .blocked
+                item.reason = reason
+                plan.items.append(item)
+                plan.notes.append("Skipped \"\(shownPath)\": \(reason)")
             }
-            let clashingFolders = targetKeys.filter { scans[0].folders[$0] != nil || scans[1].folders[$0] != nil }
+            // A file whose name (or its _past name) matches a folder in either location.
+            let pastName = Naming.name(logical: lf.logicalName, role: .past)
+            let clashingFolders = [key, Naming.joinPath(lf.parentKey, Naming.key(pastName))]
+                .filter { scans[0].folders[$0] != nil || scans[1].folders[$0] != nil }
             if !clashingFolders.isEmpty {
                 conflictKeys.insert(key)
                 conflictKeys.formUnion(clashingFolders)
                 plan.summary.conflicts += 1
-                plan.notes.append("Skipped \"\(Naming.joinPath(anyFile.parentRel, anyFile.logicalName))\": a folder has the same name as this file (or its _past name). Rename one of them.")
+                block("A folder has the same name as this file (or its _past name). Rename one of them.")
                 continue
             }
-            if Naming.name(logical: anyFile.logicalName, role: .past).utf8.count > 255 {
+            if pastName.utf8.count > 255 {
                 conflictKeys.insert(key)
                 plan.summary.conflicts += 1
-                plan.notes.append("Skipped \"\(Naming.joinPath(anyFile.parentRel, anyFile.logicalName))\": the name is too long to add \"_past\". Shorten it.")
+                block("The name is too long to add \"_past\". Shorten it.")
                 continue
             }
+            if underUnreadable(key) { block("It, or the folder it is in, couldn't be read on one drive."); continue }
+            if parked.contains(key) { block("An interrupted sync left this document half renamed. Press Sync Pair to restore it."); continue }
+
+            if let review {
+                if let limit = review.limit, !limit.contains(id) { continue }
+                if review.fingerprints[key] != Fingerprint.document(fa, fb) {
+                    plan.summary.heldBack += 1
+                    plan.notes.append("Held back \"\(shownPath)\": it changed after you compared.")
+                    continue
+                }
+            }
+
             var instances: [(side: Side, variant: FileVariant)] = []
             for v in fa?.variants ?? [] { instances.append((.a, v)) }
             for v in fb?.variants ?? [] { instances.append((.b, v)) }
-            let versions = groupVersions(instances)
-            let lf = (fa ?? fb)!
+            var versions = groupVersions(instances, demoted: state?.demoted?[key])
+            let stamp = state?.files[key]
 
-            // The current file was deleted on one side (its _past may still be there) and the other side's
-            // current file is unchanged since the last sync: the document was deleted. Remove every version.
-            if let fa, let fb, let stamp = deletionState?.files[key] {
-                var deletedOn: Side? = nil
-                for (x, fx, fy) in [(Side.a, fa, fb), (Side.b, fb, fa)] {
-                    let xLostCurrent = !fx.variants.contains { $0.role == .updated }
-                    let yCurrentUnchanged = fy.variants.contains { $0.role == .updated && $0.matches(stamp) }
-                    let nothingNewer = (fx.variants + fy.variants).allSatisfy {
-                        $0.mtime.timeIntervalSince(stamp.mtime) <= SyncConstants.timeTolerance
+            // ---- What happened?
+            if let fa, let fb {
+                let ca = Self.current(fa), cb = Self.current(fb)
+                let hasA = Self.hasCurrent(fa), hasB = Self.hasCurrent(fb)
+                if hasA != hasB {
+                    // One drive has only the _past file left.
+                    let present: Side = hasA ? .a : .b
+                    let keep = hasA ? ca : cb, rest = hasA ? fb : fa
+                    let nothingNewer = stamp.map { st in
+                        rest.variants.allSatisfy { $0.mtime.timeIntervalSince(st.mtime) <= SyncConstants.timeTolerance }
+                            || state?.demoted?[key].map { d in rest.variants.allSatisfy { $0.matches(d) } } == true
+                    } ?? false
+                    item.side = present
+                    if let stamp, keep.matches(stamp), nothingNewer {
+                        item.kind = .deleted
+                        item.reason = "Deleted on \(label(present.other)) (only its _past file is left) and unchanged on \(label(present)) since the last sync."
+                        item.suggested = canDelete ? .deleteBoth : .skip
+                    } else if stamp != nil {
+                        item.kind = .deletedButChanged
+                        item.reason = "The current file is gone from \(label(present.other)), but there are newer changes, so it is restored."
+                        item.suggested = .copyAcross
+                    } else {
+                        item.kind = .onlyHere
+                        item.reason = "\(label(present.other)) has only a _past file, and there is no sync record to say why."
+                        item.suggested = .copyAcross
                     }
-                    if xLostCurrent && yCurrentUnchanged && nothingNewer { deletedOn = x; break }
-                }
-                if let x = deletedOn {
-                    deletedFileKeys.insert(key)
-                    pendingFileDeletes.append((key, x.other, (x == .a ? fb : fa).variants))
-                    pendingFileDeletes.append((key, x, (x == .a ? fa : fb).variants))
-                    continue
-                }
-            }
-
-            if fa == nil || fb == nil, let stamp = deletionState?.files[key] {
-                let present: Side = fa != nil ? .a : .b
-                if versions[0].rep.matches(stamp) {
-                    // Synced last time, untouched since, now gone from the other side: it was deleted there.
-                    deletedFileKeys.insert(key)
-                    pendingFileDeletes.append((key, present, lf.variants))
-                    continue
-                }
-                plan.summary.keptChanged += 1
-                plan.notes.append("Kept \"\(Naming.joinPath(lf.parentRel, lf.logicalName))\": deleted in \(present.other.label) but changed in \(present.label) since the last sync. It will be restored to \(present.other.label).")
-            }
-
-            let logicalName = Naming.parse(versions[0].rep.fileName).logical
-            var group: [FileOp] = []
-            for side in Side.allCases {
-                let local = scans[side.rawValue].files[key]?.variants ?? []
-                if let op = makeOp(side: side, file: lf, logicalName: logicalName, local: local, versions: versions) {
-                    group.append(op)
-                }
-            }
-            if group.isEmpty {
-                plan.summary.unchanged += 1
-            } else {
-                for op in group {
-                    for slot in op.slots {
-                        switch slot.source {
-                        case .remote(let v):
-                            plan.summary.filesToCopy += 1
-                            plan.summary.bytesToCopy += v.size
-                        default: break
+                    item.allowed = [.copyAcross, .deleteBoth, .skip]
+                } else if ca.sameVersion(as: cb) {
+                    item.kind = .tidy
+                    item.reason = versions[0].rep.sameVersion(as: ca)
+                        ? "The current files match. Only the _past files need lining up."
+                        : "A _past file is newer than the current one, so the names will swap."
+                    item.suggested = .tidy
+                    item.allowed = [.tidy, .skip]
+                } else {
+                    let aFollowsB = fa.variants.contains { $0.role == .past && $0.sameVersion(as: cb) }
+                    let bFollowsA = fb.variants.contains { $0.role == .past && $0.sameVersion(as: ca) }
+                    let newer: Side = ca.mtime >= cb.mtime ? .a : .b
+                    let changedA = stamp.map { !ca.matches($0) }, changedB = stamp.map { !cb.matches($0) }
+                    item.allowed = [.keepA, .keepB, .keepBoth, .skip]
+                    if aFollowsB != bFollowsA {
+                        item.side = aFollowsB ? .a : .b
+                        item.kind = .edited
+                        item.reason = "\(label(item.side!)) has an edit made after the version on \(label(item.side!.other))."
+                        item.suggested = item.side == .a ? .keepA : .keepB
+                    } else if let changedA, let changedB, !(changedA && changedB) {
+                        item.side = changedA ? .a : (changedB ? .b : newer)
+                        item.kind = .edited
+                        if item.side == newer {
+                            item.reason = "Edited on \(label(newer)) since the last sync; unchanged on \(label(newer.other))."
+                        } else {
+                            item.reason = "\(label(item.side!)) now has an older copy than the one last synced. The newer one is kept unless you choose otherwise."
                         }
+                        item.suggested = newer == .a ? .keepA : .keepB
+                    } else if state == nil && versions.count <= 2 {
+                        item.kind = .differs
+                        item.side = newer
+                        item.reason = "Different on each drive, with no sync record. The newer one becomes current and the other is kept as _past."
+                        item.suggested = newer == .a ? .keepA : .keepB
+                    } else if sameContents(url(.a, ca.relPath), url(.b, cb.relPath)) {
+                        item.kind = .edited
+                        item.side = newer
+                        item.reason = "The contents are the same on both drives; only the dates differ."
+                        item.suggested = newer == .a ? .keepA : .keepB
+                    } else {
+                        item.kind = .clash
+                        item.reason = stamp == nil ? "Different on each drive, and there is no record of which follows which."
+                                                   : "Edited on both drives since the last sync. Each has changes the other doesn't."
+                        item.suggested = .skip
                     }
-                    plan.summary.displacedVersions += op.displaced.count
                 }
-                plan.summary.versionUpdates += 1
-                plan.fileGroups.append(group)
+            } else {
+                let present: Side = fa != nil ? .a : .b
+                item.side = present
+                item.allowed = [.copyAcross, .deleteBoth, .skip]
+                if let stamp {
+                    if versions[0].rep.matches(stamp) {
+                        item.kind = .deleted
+                        item.suggested = canDelete ? .deleteBoth : .skip
+                        item.reason = "Deleted on \(label(present.other)) and unchanged on \(label(present)) since the last sync."
+                    } else {
+                        item.kind = .deletedButChanged
+                        item.suggested = .copyAcross
+                        item.reason = "Deleted on \(label(present.other)), but edited on \(label(present)) since the last sync, so it is restored."
+                    }
+                } else if state != nil {
+                    item.kind = .added
+                    item.suggested = .copyAcross
+                    item.reason = "New on \(label(present)) since the last sync."
+                } else {
+                    item.kind = .onlyHere
+                    item.suggested = .copyAcross
+                    item.reason = "Only on \(label(present)). There is no sync record, so the app can't tell whether it is new or was deleted elsewhere."
+                }
             }
+            if !canDelete {
+                item.allowed.removeAll { $0 == .deleteBoth }
+                if item.kind == .deleted { item.reason += " Deletions are paused because some items couldn't be read." }
+            }
+
+            // ---- What to do about it
+            let logicalName = Naming.parse(versions[0].rep.fileName).logical
+            func operations() -> [FileOp] {
+                Side.allCases.compactMap { side in
+                    makeOp(side: side, file: lf, logicalName: logicalName,
+                           local: scans[side.rawValue].files[key]?.variants ?? [], versions: versions)
+                }
+            }
+            if item.kind == .tidy && operations().isEmpty {
+                item.kind = .unchanged
+                item.side = nil
+                item.suggested = .skip
+                item.allowed = []
+                item.reason = "The same on both drives."
+                plan.items.append(item)
+                plan.summary.unchanged += 1
+                continue
+            }
+            let decision = choice(id, item.suggested, item.allowed)
+            plan.items.append(item)
+
+            switch decision {
+            case .skip:
+                if item.kind == .clash { plan.summary.clashes += 1 } else { plan.summary.skipped += 1 }
+                continue
+            case .deleteBoth:
+                deletedFileKeys.insert(key)
+                if let fa { pendingFileDeletes.append((key, .a, fa.variants)) }
+                if let fb { pendingFileDeletes.append((key, .b, fb.variants)) }
+                continue
+            case .keepBoth:
+                guard let fa, let fb else { continue }
+                let ca = Self.current(fa), cb = Self.current(fb)
+                let loserSide: Side = ca.mtime >= cb.mtime ? .b : .a
+                let (winner, loser) = loserSide == .b ? (ca, cb) : (cb, ca)
+                let (stem, ext) = Naming.split(loser.fileName)
+                let place = Place.fileSafe(label(loserSide))
+                var newName = "", n = 1
+                repeat {
+                    newName = Naming.join(n == 1 ? "\(stem) (\(place))" : "\(stem) (\(place) \(n))", ext)
+                    n += 1
+                } while takenName(newName, in: lf.parentKey, scans: scans, claimed: claimedNames) && n < 1000
+                guard Naming.name(logical: newName, role: .past).utf8.count <= 255, n < 1000 else {
+                    plan.summary.skipped += 1
+                    plan.notes.append("Skipped \"\(shownPath)\": its name is too long to keep both.")
+                    continue
+                }
+                claimedNames.insert(Naming.joinPath(lf.parentKey, Naming.key(newName)))
+                plan.keepBoths.append(KeepBothOp(key: key, parentKey: lf.parentKey, parentRel: lf.parentRel,
+                                                 loserSide: loserSide, loser: loser, winner: winner, newName: newName))
+                plan.summary.keepBoth += 1
+                plan.summary.filesToCopy += 2
+                plan.summary.bytesToCopy += loser.size + winner.size
+                continue
+            case .keepA, .keepB:
+                // The chosen file becomes current, the other drive's becomes _past, whatever their dates.
+                guard let fa, let fb else { continue }
+                let win = decision == .keepA ? Self.current(fa) : Self.current(fb)
+                let lose = decision == .keepA ? Self.current(fb) : Self.current(fa)
+                let wi = versions.firstIndex { v in v.instances.contains { $0.variant == win && $0.side == (decision == .keepA ? .a : .b) } }!
+                let first = versions.remove(at: wi)
+                versions.insert(first, at: 0)
+                if let li = versions.firstIndex(where: { v in v.instances.contains { $0.variant == lose && $0.side == (decision == .keepA ? .b : .a) } }), li > 1 {
+                    let second = versions.remove(at: li)
+                    versions.insert(second, at: 1)
+                }
+                if versions.count > 1, versions[1].rep.mtime > versions[0].rep.mtime {
+                    plan.demote[key] = VersionStamp(size: versions[1].rep.size, mtime: versions[1].rep.mtime)
+                }
+            case .copyAcross, .tidy:
+                if item.kind == .deletedButChanged {
+                    plan.summary.keptChanged += 1
+                    plan.notes.append("Kept \"\(shownPath)\": \(item.reason)")
+                }
+            }
+
+            let group = operations()
+            if group.isEmpty { plan.summary.unchanged += 1; continue }
+            for op in group {
+                for slot in op.slots {
+                    guard case .remote(let v) = slot.source else { continue }
+                    plan.summary.filesToCopy += 1
+                    plan.summary.bytesToCopy += v.size
+                    copiesTo[key, default: []].insert(op.side)
+                }
+                plan.summary.displacedVersions += op.displaced.count
+            }
+            plan.summary.versionUpdates += 1
+            plan.fileGroups.append(group)
         }
 
         // ---- Folders ----
         let allFolderKeys = Set(scans[0].folders.keys).union(scans[1].folders.keys)
-        var candidates: [String: Side] = [:]
-        var newOneSided: [String] = []
-        for key in allFolderKeys {
-            let inA = scans[0].folders[key], inB = scans[1].folders[key]
-            if inA != nil && inB != nil { continue }
-            if conflictKeys.contains(key) { continue }
-            let present: Side = inA != nil ? .a : .b
-            if deletionState != nil && stateFolders.contains(key) {
-                candidates[key] = present
-            } else {
-                newOneSided.append(key)
-                plan.folderCreates.append(FolderCreate(target: present.other, key: key, parentKey: Naming.parent(of: key),
-                                                       sourceRel: (inA ?? inB)!, depth: key.filter { $0 == "/" }.count))
-            }
-        }
+        func presence(_ key: String) -> Int { (scans[0].folders[key] != nil ? 1 : 0) | (scans[1].folders[key] != nil ? 2 : 0) }
 
-        // A deleted folder is only removed if nothing new or changed lives inside it.
-        var survivorAncestors = Set<String>()
-        for key in allFileKeys where !deletedFileKeys.contains(key) {
-            survivorAncestors.formUnion(Naming.ancestors(of: key))
+        // Folders that still hold something that isn't being deleted, and folders a copy needs.
+        var holdsSurvivor = Set<String>()
+        var needed: [Side: Set<String>] = [.a: [], .b: []]
+        for key in allFileKeys {
+            if !deletedFileKeys.contains(key) { holdsSurvivor.formUnion(Naming.ancestors(of: key)) }
+            for side in copiesTo[key] ?? [] { needed[side]!.formUnion(Naming.ancestors(of: key)) }
         }
-        for key in newOneSided { survivorAncestors.formUnion(Naming.ancestors(of: key)) }
+        func create(_ key: String, on target: Side) {
+            plan.folderCreates.append(FolderCreate(target: target, key: key, parentKey: Naming.parent(of: key),
+                                                   sourceRel: scans[target.other.rawValue].folders[key]!,
+                                                   depth: key.filter { $0 == "/" }.count))
+            needed[target]!.formUnion(Naming.ancestors(of: key))
+        }
+        var deletedFolders: [String: Side] = [:]
+        // Deepest first, so a parent knows what became of everything inside it.
+        for key in allFolderKeys.sorted(by: { a, b in
+            let da = a.filter { $0 == "/" }.count, db = b.filter { $0 == "/" }.count
+            return da != db ? da > db : a < b
+        }) {
+            let here = presence(key)
+            let id = DiffItem.folderID(key)
+            let rel = scans[0].folders[key] ?? scans[1].folders[key]!
+            var item = DiffItem(id: id, key: key, parentKey: Naming.parent(of: key), name: Naming.lastComponent(rel), isFolder: true,
+                                kind: .unchanged, side: nil, a: nil, b: nil, suggested: .skip, allowed: [], reason: "On both drives.")
+            if let r = scans[0].folders[key] { item.a = SideInfo(relPath: r, size: 0, mtime: .distantPast, isPackage: false) }
+            if let r = scans[1].folders[key] { item.b = SideInfo(relPath: r, size: 0, mtime: .distantPast, isPackage: false) }
+            if here == 3 { plan.items.append(item); holdsSurvivor.formUnion(Naming.ancestors(of: key)); continue }
 
-        var deletedFolders = Set<String>()
-        for (key, side) in candidates {
-            if survivorAncestors.contains(key) {
-                let rel = plan.scans[side.rawValue].folders[key]!
-                plan.summary.keptChanged += 1
-                plan.notes.append("Kept folder \"\(rel)\": deleted in \(side.other.label) but has new or changed items in \(side.label). It will be restored to \(side.other.label).")
-                plan.folderCreates.append(FolderCreate(target: side.other, key: key, parentKey: Naming.parent(of: key),
-                                                       sourceRel: rel, depth: key.filter { $0 == "/" }.count))
-            } else {
-                deletedFolders.insert(key)
+            let present: Side = here == 1 ? .a : .b
+            item.side = present
+            if conflictKeys.contains(key) || underUnreadable(key) {
+                item.kind = .blocked
+                item.reason = conflictKeys.contains(key) ? "A file has the same name as this folder." : "It couldn't be read on one drive."
+                plan.items.append(item)
+                holdsSurvivor.formUnion(Naming.ancestors(of: key))
+                continue
             }
+            let wasSynced = stateFolders.contains(key)
+            item.allowed = canDelete ? [.copyAcross, .deleteBoth, .skip] : [.copyAcross, .skip]
+            if wasSynced {
+                item.kind = .deleted
+                item.suggested = canDelete ? .deleteBoth : .skip
+                item.reason = "Deleted on \(label(present.other)) since the last sync."
+            } else {
+                item.kind = state == nil ? .onlyHere : .added
+                item.suggested = .copyAcross
+                item.reason = state == nil ? "Only on \(label(present)). There is no sync record to say why." : "New on \(label(present)) since the last sync."
+            }
+            let changedSinceReview = review.map { $0.folders[key] != here } ?? false
+            let decision = changedSinceReview ? .skip : choice(id, item.suggested, item.allowed)
+            let mustExist = needed[present.other]!.contains(key)
+            if decision == .deleteBoth && !holdsSurvivor.contains(key) && canDelete {
+                deletedFolders[key] = present
+            } else {
+                holdsSurvivor.formUnion(Naming.ancestors(of: key))
+                if mustExist || decision == .copyAcross {
+                    create(key, on: present.other)
+                    if wasSynced {
+                        if review == nil { item.kind = .deletedButChanged }
+                        item.suggested = .copyAcross
+                        item.reason = "Deleted on \(label(present.other)), but it holds new or changed items on \(label(present)), so it is restored."
+                        plan.summary.keptChanged += 1
+                        plan.notes.append("Kept folder \"\(rel)\": \(item.reason)")
+                    }
+                } else if decision == .deleteBoth {
+                    // Something inside is being skipped, so the folder has to stay.
+                    item.suggested = .skip
+                } else if review?.limit == nil {
+                    plan.summary.skipped += 1
+                }
+            }
+            plan.items.append(item)
         }
         plan.folderCreates.sort { $0.depth != $1.depth ? $0.depth < $1.depth : $0.key < $1.key }
         plan.summary.foldersToCreate = plan.folderCreates.count
 
-        func coveredByFolderDelete(_ key: String) -> Bool {
-            Naming.ancestors(of: key).contains { deletedFolders.contains($0) }
+        func coveredByFolderDelete(_ key: String, _ side: Side) -> Bool {
+            Naming.ancestors(of: key).contains { deletedFolders[$0] == side }
         }
-        for key in deletedFolders.sorted() where !coveredByFolderDelete(key) {
-            let side = candidates[key]!
+        for (key, side) in deletedFolders.sorted(by: { $0.key < $1.key }) where !coveredByFolderDelete(key, side) {
             let scan = scans[side.rawValue]
             var op = DeleteOp(side: side, relPath: scan.folders[key]!, isFolder: true)
             for (fk, lf) in scan.files where fk.hasPrefix(key + "/") {
@@ -796,7 +1052,7 @@ nonisolated final class SyncEngine: @unchecked Sendable {
             op.expectedFolders = Set(scan.folders.keys.filter { $0 == key || $0.hasPrefix(key + "/") })
             plan.deletes.append(op)
         }
-        for d in pendingFileDeletes where !coveredByFolderDelete(d.key) {
+        for d in pendingFileDeletes where !coveredByFolderDelete(d.key, d.side) {
             for v in d.variants {
                 plan.deletes.append(DeleteOp(side: d.side, relPath: v.relPath, isFolder: false, expectedFiles: [v.relPath: v]))
             }
@@ -804,6 +1060,24 @@ nonisolated final class SyncEngine: @unchecked Sendable {
         plan.summary.filesToDelete = deletedFileKeys.count
         plan.summary.foldersToDelete = deletedFolders.count
         return plan
+    }
+
+    /// True when a new file can't use this name: it, its _past name, or the document it would join exists.
+    private func takenName(_ name: String, in parentKey: String, scans: [SideScan], claimed: Set<String>) -> Bool {
+        let key = Naming.joinPath(parentKey, Naming.key(Naming.parse(name).logical))
+        let full = Naming.joinPath(parentKey, Naming.key(name))
+        return claimed.contains(full) || scans.contains { $0.files[key] != nil || $0.folders[full] != nil || $0.folders[key] != nil }
+    }
+
+    /// Everything needed to check, at Apply, that the drives still look the way the user saw them.
+    static func review(of plan: SyncPlan) -> Review {
+        var r = Review(syncID: plan.oldState?.syncID)
+        let a = plan.scans[0], b = plan.scans[1]
+        for key in Set(a.files.keys).union(b.files.keys) { r.fingerprints[key] = Fingerprint.document(a.files[key], b.files[key]) }
+        for key in Set(a.folders.keys).union(b.folders.keys) {
+            r.folders[key] = (a.folders[key] != nil ? 1 : 0) | (b.folders[key] != nil ? 2 : 0)
+        }
+        return r
     }
 
     private func makeOp(side: Side, file: LogicalFile, logicalName: String, local: [FileVariant], versions: [Version]) -> FileOp? {
@@ -849,7 +1123,8 @@ nonisolated final class SyncEngine: @unchecked Sendable {
 
         // Free-space check per destination.
         for side in Side.allCases {
-            let needed = plan.fileGroups.joined().filter { $0.side == side }.reduce(Int64(0)) { $0 + $1.bytesToCopy }
+            var needed = plan.fileGroups.joined().filter { $0.side == side }.reduce(Int64(0)) { $0 + $1.bytesToCopy }
+            for k in plan.keepBoths { needed += k.loserSide == side ? k.winner.size : k.loser.size }
             guard needed > 0 else { continue }
             let values = try? root(side).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey])
             var available = values?.volumeAvailableCapacityForImportantUsage ?? 0
@@ -859,7 +1134,7 @@ nonisolated final class SyncEngine: @unchecked Sendable {
             }
         }
 
-        let items = plan.folderCreates.count + plan.fileGroups.count + plan.deletes.count
+        let items = plan.folderCreates.count + plan.fileGroups.count + plan.keepBoths.count + plan.deletes.count
         progress = SyncProgress()
         progress.bytesTotal = plan.summary.bytesToCopy
         progress.itemsTotal = items
@@ -919,6 +1194,18 @@ nonisolated final class SyncEngine: @unchecked Sendable {
                         result.bytesCopied += v.size
                     }
                 }
+                // A file saved while it was being copied gives a mixed copy: check again before using it.
+                if let changed = firstChangedVariant(in: group) {
+                    throw SyncError.failed("\(changed) changed while it was being copied. Nothing was replaced; sync again.")
+                }
+                for (i, op) in group.enumerated() {
+                    for (j, slot) in op.slots.enumerated() {
+                        guard case .remote(let v) = slot.source, let tmp = temps[i][j] else { continue }
+                        guard currentStats(tmp)?.size == v.size else {
+                            throw SyncError.failed("The copy of \(v.relPath) is incomplete. Nothing was replaced; sync again.")
+                        }
+                    }
+                }
                 // 2b. Arrange each side: retire old versions, rename, move copies into place.
                 for (i, op) in group.enumerated() {
                     let dirRel = parentRel(op.side, parentKey: op.parentKey, fallback: op.sourceParentRel)
@@ -937,6 +1224,22 @@ nonisolated final class SyncEngine: @unchecked Sendable {
             finishItem()
         }
 
+        // 2c. Documents kept as two separate files
+        for k in plan.keepBoths {
+            try checkCancel()
+            progress.currentItem = k.loser.relPath
+            do {
+                try keepBoth(k, dir: { self.url($0, parentRel($0, parentKey: k.parentKey, fallback: k.parentRel)) }, result: &result)
+            } catch SyncError.cancelled {
+                throw SyncError.cancelled
+            } catch {
+                result.errors += 1
+                log("Failed on \(k.loser.relPath): \(error.localizedDescription)", .error)
+                try ensureRootsAvailable()
+            }
+            finishItem()
+        }
+
         // 3. Deletions carried over from the other location (to Trash, recoverable)
         setPhase("Removing deleted items…", indeterminate: false)
         for d in plan.deletes {
@@ -950,7 +1253,7 @@ nonisolated final class SyncEngine: @unchecked Sendable {
             do {
                 try moveToTrash(url(d.side, d.relPath), side: d.side)
                 result.trashed += 1
-                log("\(sideName(d.side)) Moved to Trash \(d.isFolder ? "folder " : "")\(d.relPath) (deleted in \(d.side.other.label) since last sync)")
+                log("\(sideName(d.side)) Moved to Trash \(d.isFolder ? "folder " : "")\(d.relPath) ")
             } catch {
                 result.errors += 1
                 log("\(sideName(d.side)) Could not remove \(d.relPath): \(error.localizedDescription)", .error)
@@ -965,33 +1268,40 @@ nonisolated final class SyncEngine: @unchecked Sendable {
         let finalA = try scan(.a), finalB = try scan(.b)
         let now = Date()
         var files: [String: VersionStamp] = [:]
+        var demoted: [String: VersionStamp] = [:]
         var mismatched = 0
         for key in Set(finalA.files.keys).union(finalB.files.keys) {
-            let fa = finalA.files[key], fb = finalB.files[key]
-            if let fa, let fb {
-                let newest = (fa.variants + fb.variants).max(by: { $0.mtime < $1.mtime })!
+            // Only a document that really is the same on both drives counts as synced. Anything skipped,
+            // failed, or edited during the sync keeps its earlier record, so the next check still sees it.
+            if let fa = finalA.files[key], let fb = finalB.files[key],
+               Self.hasCurrent(fa) == Self.hasCurrent(fb), Self.current(fa).sameVersion(as: Self.current(fb)) {
+                let ca = Self.current(fa), cb = Self.current(fb)
+                let newest = ca.mtime >= cb.mtime ? ca : cb
                 files[key] = VersionStamp(size: newest.size, mtime: newest.mtime)
+                if let d = plan.demote[key] ?? plan.oldState?.demoted?[key],
+                   (fa.variants + fb.variants).contains(where: { $0.role == .past && $0.matches(d) }) { demoted[key] = d }
             } else {
                 mismatched += 1
-                // Keep a pending deletion pending; anything else is treated as new next time.
                 if let old = plan.oldState?.files[key] { files[key] = old }
+                if let old = plan.oldState?.demoted?[key] { demoted[key] = old }
             }
         }
         var folders = Set(finalA.folders.keys).intersection(finalB.folders.keys)
         let oneSidedFolders = Set(finalA.folders.keys).symmetricDifference(finalB.folders.keys)
         folders.formUnion(oneSidedFolders.intersection(plan.oldState?.folders ?? []))
         if mismatched > 0 || !oneSidedFolders.isEmpty {
-            log("\(mismatched) document(s) and \(oneSidedFolders.count) folder(s) still differ between A and B (see errors above). Run sync again after fixing.", .warning)
+            log("\(mismatched) document(s) and \(oneSidedFolders.count) folder(s) still differ between A and B (skipped, waiting for your choice, or failed).", .warning)
         }
 
-        let state = SyncState(pairID: pair.id, syncID: UUID(), lastSync: now, files: files, folders: folders.sorted())
+        let state = SyncState(pairID: pair.id, syncID: UUID(), lastSync: now, files: files, folders: folders.sorted(),
+                              demoted: demoted.isEmpty ? nil : demoted)
         for side in Side.allCases {
             do { try writeState(state, side) } catch {
                 result.errors += 1
                 log("\(sideName(side)) Could not save the sync record: \(error.localizedDescription)", .error)
             }
         }
-        result.structureFileName = writeStructureFiles(scanA: finalA, date: now, errors: result.errors)
+        result.structureFileName = writeStructureFiles(scans: [finalA, finalB], date: now, errors: result.errors)
         result.completed = true
         result.lastSync = now
         progress.fraction = 1
@@ -1037,8 +1347,9 @@ nonisolated final class SyncEngine: @unchecked Sendable {
             return unchanged(v, on: d.side) ? nil : "it changed after the sync was planned"
         }
         let folderURL = url(d.side, d.relPath)
-        let rootPath = root(d.side).path
-        guard let en = fm.enumerator(at: folderURL, includingPropertiesForKeys: [.isDirectoryKey, .isPackageKey, .isSymbolicLinkKey], options: []) else {
+        var readFailed = false
+        guard let en = fm.enumerator(at: folderURL, includingPropertiesForKeys: [.isDirectoryKey, .isPackageKey, .isSymbolicLinkKey],
+                                     options: [.producesRelativePathURLs], errorHandler: { _, _ in readFailed = true; return false }) else {
             return "it couldn't be read"
         }
         for case let item as URL in en {
@@ -1046,8 +1357,9 @@ nonisolated final class SyncEngine: @unchecked Sendable {
             if name == ".DS_Store" || name == ".localized" || name.hasPrefix("._") || name.hasPrefix(SyncConstants.tempPrefix)
                 || SyncConstants.ignoredNames.contains(name) || name.hasPrefix("~$") { continue }
             if name.hasPrefix(".") { return "it contains hidden files (\(name)) that aren't synced" }
-            guard item.path.hasPrefix(rootPath + "/") else { return "unexpected path" }
-            let rel = String(item.path.dropFirst(rootPath.count + 1))
+            var inner = item.relativePath
+            while inner.hasSuffix("/") { inner.removeLast() }
+            let rel = Naming.joinPath(d.relPath, inner)
             let v = try? item.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey, .isSymbolicLinkKey])
             if v?.isSymbolicLink == true { return "it contains an alias/symlink (\(name))" }
             if v?.isDirectory == true && v?.isPackage != true {
@@ -1058,6 +1370,7 @@ nonisolated final class SyncEngine: @unchecked Sendable {
             guard let expected = d.expectedFiles[rel] else { return "a new item appeared inside it (\(name))" }
             if !unchanged(expected, on: d.side) { return "\(name) inside it changed" }
         }
+        if readFailed { return "part of it couldn't be read" }
         return nil
     }
 
@@ -1071,13 +1384,6 @@ nonisolated final class SyncEngine: @unchecked Sendable {
     private func arrange(_ op: FileOp, dirRel: String, temps: [URL?]) throws -> Int {
         let dir = url(op.side, dirRel)
         var trashed = 0
-
-        // Retire versions that are no longer the newest or second newest.
-        for v in op.displaced {
-            try moveToTrash(url(op.side, v.relPath), side: op.side)
-            trashed += 1
-            log("\(sideName(op.side)) Old version to Trash: \(v.relPath)")
-        }
 
         // Local renames (e.g. report.docx -> report_past.docx when a newer report.docx arrives).
         var moves: [(from: URL, to: URL, label: String)] = []
@@ -1097,12 +1403,18 @@ nonisolated final class SyncEngine: @unchecked Sendable {
         func sameItem(_ a: URL, _ b: URL) -> Bool { Naming.key(a.path) == Naming.key(b.path) }
         // Anything sitting at a target name that this document doesn't own is left alone: stop instead.
         for target in (moves.map(\.to) + placements.map(\.to)) where fm.fileExists(atPath: target.path) {
-            if !moves.contains(where: { sameItem($0.from, target) }) {
+            if !moves.contains(where: { sameItem($0.from, target) })
+                && !op.displaced.contains(where: { sameItem(url(op.side, $0.relPath), target) }) {
                 throw SyncError.failed("\"\(target.lastPathComponent)\" already exists and isn't a version of this document, so nothing was changed. Rename it and sync again.")
             }
         }
+        // Retire versions that are no longer the newest or second newest.
+        for v in op.displaced {
+            try moveToTrash(url(op.side, v.relPath), side: op.side)
+            trashed += 1
+            log("\(sideName(op.side)) Old version to Trash: \(v.relPath)")
+        }
         while !moves.isEmpty {
-            try checkCancel()
             if let i = moves.firstIndex(where: { !fm.fileExists(atPath: $0.to.path) }) {
                 try fm.moveItem(at: moves[i].from, to: moves[i].to)
                 log("\(sideName(op.side)) \(moves[i].label)")
@@ -1125,6 +1437,52 @@ nonisolated final class SyncEngine: @unchecked Sendable {
             log("\(sideName(op.side)) \(p.label)")
         }
         return trashed
+    }
+
+    /// Both edits survive: the newer keeps the name, the other is saved beside it on both drives.
+    /// Stopping at any point leaves every edit in at least one place.
+    private func keepBoth(_ k: KeepBothOp, dir: (Side) -> URL, result: inout SyncResult) throws {
+        let winSide = k.loserSide.other
+        let tmpOnWin = dir(winSide).appendingPathComponent(SyncConstants.tempPrefix + UUID().uuidString)
+        let tmpOnLose = dir(k.loserSide).appendingPathComponent(SyncConstants.tempPrefix + UUID().uuidString)
+        defer { for t in [tmpOnWin, tmpOnLose] where fm.fileExists(atPath: t.path) { try? fm.removeItem(at: t) } }
+        func ready() -> Bool { unchanged(k.loser, on: k.loserSide) && unchanged(k.winner, on: winSide) }
+        guard ready() else { throw SyncError.failed("it changed after you looked, so nothing was done. Compare again.") }
+        try copyItem(from: url(k.loserSide, k.loser.relPath), to: tmpOnWin, expectedSize: k.loser.size)
+        try copyItem(from: url(winSide, k.winner.relPath), to: tmpOnLose, expectedSize: k.winner.size)
+        guard ready(), currentStats(tmpOnWin)?.size == k.loser.size, currentStats(tmpOnLose)?.size == k.winner.size else {
+            throw SyncError.failed("it changed while being copied, so nothing was done. Compare again.")
+        }
+        let newOnLose = dir(k.loserSide).appendingPathComponent(k.newName)
+        let newOnWin = dir(winSide).appendingPathComponent(k.newName)
+        for u in [newOnLose, newOnWin] where fm.fileExists(atPath: u.path) {
+            throw SyncError.failed("\"\(k.newName)\" already exists, so nothing was done.")
+        }
+        let original = url(k.loserSide, k.loser.relPath)
+        try fm.moveItem(at: original, to: newOnLose)
+        try fm.moveItem(at: tmpOnLose, to: dir(k.loserSide).appendingPathComponent(k.winner.fileName))
+        try fm.moveItem(at: tmpOnWin, to: newOnWin)
+        result.copied += 2
+        result.bytesCopied += k.loser.size + k.winner.size
+        log("Kept both: \(k.winner.relPath) and \(k.newName)")
+    }
+
+    static func hasCurrent(_ f: LogicalFile) -> Bool { f.variants.contains { $0.role == .updated } }
+
+    /// The file under the plain name, or the newest _past when there is none.
+    static func current(_ f: LogicalFile) -> FileVariant {
+        f.variants.filter { $0.role == .updated }.max { $0.mtime < $1.mtime } ?? f.variants.max { $0.mtime < $1.mtime }!
+    }
+
+    /// Byte-for-byte comparison, used only to tell a real clash from the same edit saved twice.
+    private func sameContents(_ a: URL, _ b: URL, limit: Int64 = 64_000_000) -> Bool {
+        guard let sa = currentStats(a), let sb = currentStats(b), !sa.isDir, !sb.isDir, sa.size == sb.size, sa.size <= limit,
+              let ha = try? FileHandle(forReadingFrom: a), let hb = try? FileHandle(forReadingFrom: b) else { return false }
+        defer { try? ha.close(); try? hb.close() }
+        while true {
+            guard let x = try? ha.read(upToCount: 1 << 20) ?? Data(), let y = try? hb.read(upToCount: 1 << 20) ?? Data(), x == y else { return false }
+            if x.isEmpty { return true }
+        }
     }
 
     /// Tests only: send "trashed" items here instead of the real Trash.
@@ -1249,10 +1607,9 @@ nonisolated final class SyncEngine: @unchecked Sendable {
     // MARK: - File structure text file
 
     @discardableResult
-    func writeStructureFiles(scanA: SideScan, date: Date, errors: Int) -> String? {
+    func writeStructureFiles(scans: [SideScan], date: Date, errors: Int) -> String? {
         let rootName = root(.a).lastPathComponent
         let fileName = "\(rootName)\(SyncConstants.structureMarker)\(Fmt.fileStamp(date)).txt"
-        let text = structureText(scan: scanA, rootName: rootName, date: date, errors: errors)
         var wrote = false
         for side in Side.allCases {
             let r = root(side)
@@ -1270,6 +1627,8 @@ nonisolated final class SyncEngine: @unchecked Sendable {
                     }
                 }
             }
+            // Each drive's map lists what is really on that drive (they differ while something is skipped).
+            let text = structureText(scan: scans[side.rawValue], rootName: rootName, date: date, errors: errors)
             do {
                 try text.write(to: r.appendingPathComponent(fileName), atomically: true, encoding: .utf8)
                 wrote = true
