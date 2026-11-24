@@ -462,7 +462,7 @@ struct QuickLookPreview: NSViewRepresentable {
 
 /// Read-only copies used for looking at both versions at once.
 nonisolated enum ReviewFiles {
-    static var folder: URL { FileManager.default.temporaryDirectory.appendingPathComponent("ProjectDriveSync Review", isDirectory: true) }
+    static var folder: URL { FileManager.default.temporaryDirectory.appendingPathComponent("Digital Drive Linkages Review", isDirectory: true) }
 
     static func clear() { try? FileManager.default.removeItem(at: folder) }
 

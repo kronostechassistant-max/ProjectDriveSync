@@ -1,4 +1,4 @@
-# Project Drive Sync
+# Digital Drive Linkages
 
 A macOS app that keeps two folders with the same name in step, usually on external drives. It acts only when you ask: there is no background watching.
 
@@ -6,10 +6,12 @@ Requires macOS 14 or later. Runs on Apple Silicon and Intel Macs.
 
 ## Install
 1. Download the `.zip` from **Releases** and open it.
-2. Move **Project Drive Sync** to your Applications folder.
+2. Move **Digital Drive Linkages** to your Applications folder.
 3. The first time you open it, macOS may block it because the app isn't notarized by Apple. Go to **System Settings → Privacy & Security**, scroll down and click **Open Anyway**. You may be asked once more to allow access to your drives.
 
 To update, use **Check for Updates**, download the new version, quit the app and replace it. Your pairs are kept.
+
+Coming from **Project Drive Sync** (the earlier name)? Quit it, install Digital Drive Linkages, then move the old app to the Trash. Your pairs carry over.
 
 ## Use
 - **Create Synced Pair:** choose the same-named folder in two places.

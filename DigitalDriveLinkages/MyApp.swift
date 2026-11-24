@@ -5,7 +5,7 @@ import AppKit
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        Window("Project Drive Sync", id: "main") {
+        Window("Digital Drive Linkages", id: "main") {
             ContentView(model: AppModel.shared)
         }
         .defaultSize(width: 820, height: 780)

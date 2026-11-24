@@ -2,7 +2,7 @@ import Foundation
 
 /// Looks at the latest GitHub release, only when the user asks.
 nonisolated enum UpdateChecker {
-    static let repository = "kronostechassistant-max/ProjectDriveSync"
+    static let repository = "kronostechassistant-max/DigitalDriveLinkages"
 
     struct Release: Sendable {
         var version: String
@@ -20,7 +20,7 @@ nonisolated enum UpdateChecker {
     static func check() async -> Outcome {
         var request = URLRequest(url: URL(string: "https://api.github.com/repos/\(repository)/releases/latest")!, timeoutInterval: 15)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-        request.setValue("ProjectDriveSync", forHTTPHeaderField: "User-Agent")
+        request.setValue("DigitalDriveLinkages", forHTTPHeaderField: "User-Agent")
         request.cachePolicy = .reloadIgnoringLocalCacheData
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
@@ -40,7 +40,7 @@ nonisolated enum UpdateChecker {
               let tag = j["tag_name"] as? String, let page = (j["html_url"] as? String).flatMap(URL.init(string:)),
               page.scheme == "https", page.host == "github.com" else { return nil }
         let names = (j["assets"] as? [[String: Any]] ?? []).compactMap { $0["name"] as? String }
-        // Release files are named "ProjectDriveSync-1.25-build2.zip".
+        // Release files are named "DigitalDriveLinkages-1.26-build3.zip".
         let build = names.compactMap { name -> Int? in
             guard let r = name.range(of: "-build") else { return nil }
             return Int(name[r.upperBound...].prefix { $0.isNumber })

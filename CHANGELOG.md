@@ -1,6 +1,18 @@
-# Project Drive Sync — Journal
+# Digital Drive Linkages — Journal
 
-To release a new version: raise `MARKETING_VERSION` (and `CURRENT_PROJECT_VERSION`) in `ProjectDriveSync.xcodeproj/project.xcproj`, add an entry below, then run `./build-and-install.sh`. The app reads its version number from the build settings, so the window and logs update on their own.
+Called **Project Drive Sync** up to version 1.25.
+
+To release a new version: raise `MARKETING_VERSION` (and `CURRENT_PROJECT_VERSION`) in `DigitalDriveLinkages.xcodeproj/project.xcproj`, add an entry below, then run `./build-and-install.sh`. The app reads its version number from the build settings, so the window and logs update on their own.
+
+---
+
+## Version 1.26 (build 3) — 24 November 2026
+
+### New name
+- The app is now **Digital Drive Linkages** (it was Project Drive Sync). The window, menus, messages, project, repository and download files use the new name. Nothing about how it syncs has changed.
+- Kept under the first name on purpose, so pairs, settings and history carry over and version 1.25 and this one can't work on a pair at the same time (1.0 has no lock): the hidden records and lock on each drive, the "ProjectDriveSync Removed Items" folder (used only on drives without a Trash), the saved pairs, the logs folder and the bundle identifier.
+- The example folder name shown in the app is now "Photos".
+- It installs as a new app, so macOS may ask again for access to drives. The old app can then go to the Trash.
 
 ---
 

@@ -47,7 +47,7 @@ func rel(_ v: String, _ b: Int?) -> UpdateChecker.Release { .init(version: v, bu
 check(UpdateChecker.isNewer(rel("1.5", 3), than: "1.25", build: 2), "build 3 is newer than build 2")
 check(!UpdateChecker.isNewer(rel("1.25", 2), than: "1.25", build: 2) && !UpdateChecker.isNewer(rel("1.0", 1), than: "1.25", build: 2), "same or older is not an update")
 check(UpdateChecker.isNewer(rel("1.5", nil), than: "1.25", build: 2) && !UpdateChecker.isNewer(rel("1.0", nil), than: "1.25", build: 2), "without a build number: 1.5 > 1.25 > 1.0")
-let json = #"{"tag_name":"v1.5","html_url":"https://github.com/o/r/releases/tag/v1.5","assets":[{"name":"ProjectDriveSync-1.5-build3.zip"}]}"#
+let json = #"{"tag_name":"v1.5","html_url":"https://github.com/o/r/releases/tag/v1.5","assets":[{"name":"DigitalDriveLinkages-1.5-build3.zip"}]}"#
 let r = UpdateChecker.parse(Data(json.utf8)); check(r?.version == "1.5" && r?.build == 3, "reads a GitHub release")
 check(UpdateChecker.parse(Data(json.replacingOccurrences(of: "https://github.com", with: "http://evil.example").utf8)) == nil, "refuses a link that isn't GitHub")
 

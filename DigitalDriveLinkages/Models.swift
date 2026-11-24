@@ -28,6 +28,7 @@ nonisolated enum PairStatus: Sendable, Equatable {
     }
 }
 
+/// The folder keeps the app's first name so saved pairs carry over.
 /// Saved list of pairs: ~/Library/Application Support/ProjectDriveSync/pairs.json
 nonisolated enum PairStore {
     static var directory: URL {
@@ -83,7 +84,7 @@ nonisolated enum PairStore {
         }
         if a == "/" || b == "/" || a.hasPrefix("/Volumes/") && a.split(separator: "/").count == 2
             || b.hasPrefix("/Volumes/") && b.split(separator: "/").count == 2 {
-            return .failure(.init("Pick a folder (for example \"General Projects\"), not a whole drive."))
+            return .failure(.init("Pick a folder (for example \"Photos\"), not a whole drive."))
         }
         let nameA = (a as NSString).lastPathComponent, nameB = (b as NSString).lastPathComponent
         guard nameA.precomposedStringWithCanonicalMapping.lowercased()

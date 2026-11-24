@@ -4,6 +4,7 @@ import Darwin
 // MARK: - Constants & naming
 
 nonisolated enum SyncConstants {
+    // Names stored on drives keep the app's first name (Project Drive Sync), so pairs, locks and older versions still work.
     /// Hidden per-pair record of the last sync, stored in the root of both folders.
     static let stateFilePrefix = ".projectdrivesync-"
     /// Partial copies (safe to delete if left behind).
@@ -393,7 +394,7 @@ nonisolated final class SyncEngine: @unchecked Sendable {
             let url = dir.appendingPathComponent("\(safeName) \(Fmt.logFileStamp(Date())).log")
             FileManager.default.createFile(atPath: url.path, contents: nil)
             logHandle = try? FileHandle(forWritingTo: url)
-            if let data = "Project Drive Sync \(Fmt.appVersion)\n".data(using: .utf8) { try? logHandle?.write(contentsOf: data) }
+            if let data = "Digital Drive Linkages \(Fmt.appVersion)\n".data(using: .utf8) { try? logHandle?.write(contentsOf: data) }
             logFileURL = url
         } else {
             logFileURL = nil
@@ -673,7 +674,7 @@ nonisolated final class SyncEngine: @unchecked Sendable {
             if flock(fd, LOCK_EX | LOCK_NB) != 0 {
                 let busy = errno == EWOULDBLOCK
                 close(fd)
-                if busy { throw SyncError.failed("Another copy of Project Drive Sync is using \(root(side).path). Try again when it has finished.") }
+                if busy { throw SyncError.failed("Another copy of Digital Drive Linkages is using \(root(side).path). Try again when it has finished.") }
                 continue
             }
             lockHandles.append(fd)

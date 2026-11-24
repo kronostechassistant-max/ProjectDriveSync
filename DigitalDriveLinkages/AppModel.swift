@@ -52,7 +52,7 @@ final class AppModel {
     init() {
         pairs = PairStore.load()
         refreshAvailability(manual: false)
-        addLog("Project Drive Sync \(Fmt.appVersion). Ready. \(availablePairs.count) of \(pairs.count) pair(s) available.")
+        addLog("Digital Drive Linkages \(Fmt.appVersion). Ready. \(availablePairs.count) of \(pairs.count) pair(s) available.")
         flushLog()
 
         // Keep the drop-down current when drives are plugged in or ejected. This only checks

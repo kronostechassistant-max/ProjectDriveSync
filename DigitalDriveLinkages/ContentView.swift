@@ -119,7 +119,7 @@ struct ContentView: View {
             }
             GroupBox {
                 if model.pairs.isEmpty {
-                    Text("No pairs yet. Use Create Synced Pair to choose two folders with the same name, for example \"General Projects\" on this Mac and on an external drive.")
+                    Text("No pairs yet. Use Create Synced Pair to choose two folders with the same name, for example \"Photos\" on this Mac and on an external drive.")
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(8)
@@ -336,7 +336,7 @@ struct CreatePairSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Create Synced Pair").font(.title2.bold())
-            Text("Choose the same folder in two places, for example \"General Projects\" on two drives. Both folders must have the same name. If you choose a whole drive for one side, a folder with the other side's name is made on it. If you choose whole drives for both, \"\(PairStore.untitledFolderName)\" is made on each.")
+            Text("Choose the same folder in two places, for example \"Photos\" on two drives. Both folders must have the same name. If you choose a whole drive for one side, a folder with the other side's name is made on it. If you choose whole drives for both, \"\(PairStore.untitledFolderName)\" is made on each.")
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
