@@ -683,17 +683,23 @@ nonisolated final class SyncEngine: @unchecked Sendable {
 
     /// FAT32 keeps local time, so a daylight-saving change moves its dates by an hour.
     var fatOverride: Bool?
-    private lazy var usesFAT: Bool = fatOverride ?? Side.allCases.contains { side in
-        var fs = statfs()
-        guard statfs(root(side).path, &fs) == 0 else { return false }
-        return withUnsafeBytes(of: fs.f_fstypename) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) } == "msdos"
+    private var fatChecked: Bool?
+    private func usesFAT() -> Bool {
+        if let known = fatOverride ?? fatChecked { return known }
+        let found = Side.allCases.contains { side in
+            var fs = statfs()
+            guard statfs(root(side).path, &fs) == 0 else { return false }
+            return withUnsafeBytes(of: fs.f_fstypename) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) } == "msdos"
+        }
+        fatChecked = found
+        return found
     }
 
     /// The same version on two drives. Exactly an hour apart counts only on FAT32, and only if the contents match.
     private func same(_ x: FileVariant, _ sx: Side, _ y: FileVariant, _ sy: Side) -> Bool {
         guard x.size == y.size else { return false }
         if FileVariant.sameTime(x.mtime, y.mtime) { return true }
-        guard sx != sy, usesFAT,
+        guard sx != sy, usesFAT(),
               abs(abs(x.mtime.timeIntervalSince(y.mtime)) - 3600) <= SyncConstants.timeTolerance else { return false }
         return sameContents(url(sx, x.relPath), url(sy, y.relPath), limit: .max)
     }
