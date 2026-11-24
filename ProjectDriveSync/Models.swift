@@ -31,6 +31,9 @@ nonisolated enum PairStatus: Sendable, Equatable {
 /// Saved list of pairs: ~/Library/Application Support/ProjectDriveSync/pairs.json
 nonisolated enum PairStore {
     static var directory: URL {
+        #if DEBUG
+        if let test = ProcessInfo.processInfo.environment["PDS_DATA"] { return URL(fileURLWithPath: test, isDirectory: true) }
+        #endif
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
         return base.appendingPathComponent("ProjectDriveSync", isDirectory: true)

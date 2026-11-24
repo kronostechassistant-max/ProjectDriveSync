@@ -6,24 +6,36 @@ struct ContentView: View {
     @State private var showCreate = false
     @State private var pairToRemove: SyncPair?
 
+    @AppStorage(AppModel.compareFirstKey) private var compareFirst = false
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            actionBar
-            progressPanel
-            pairsSection
-            logSection
+        Group {
+            if let c = model.comparison {
+                CompareView(model: model, comparison: c)
+            } else {
+                VStack(alignment: .leading, spacing: 16) {
+                    actionBar
+                    ProgressPanel(model: model)
+                    pairsSection
+                    logSection
+                }
+                .padding(20)
+            }
         }
-        .padding(20)
-        .frame(minWidth: 760, minHeight: 700, alignment: .top)
+        .frame(minWidth: 860, minHeight: 700, alignment: .top)
         .sheet(isPresented: $showCreate) { CreatePairSheet(model: model) }
-        .alert("Review this sync", isPresented: Binding(
-            get: { model.pendingConfirmation != nil },
-            set: { if !$0 { model.declinePendingSync() } }
-        ), presenting: model.pendingConfirmation) { _ in
-            Button("Sync Now") { model.confirmPendingSync() }
-            Button("Cancel", role: .cancel) { model.declinePendingSync() }
-        } message: { pending in
-            Text("\(pending.pair.name)\n\n" + pending.summary.lines.joined(separator: "\n\n"))
+        .alert(model.update?.title ?? "", isPresented: Binding(
+            get: { model.update != nil },
+            set: { if !$0 { model.update = nil } }
+        ), presenting: model.update) { u in
+            if let page = u.page {
+                Button("Open Download Page") { NSWorkspace.shared.open(page) }
+                Button("Later", role: .cancel) {}
+            } else {
+                Button("OK", role: .cancel) {}
+            }
+        } message: { u in
+            Text(u.message)
         }
         .alert("Something went wrong", isPresented: Binding(
             get: { model.errorMessage != nil },
@@ -62,6 +74,14 @@ struct ContentView: View {
             .disabled(model.isBusy || model.selectedPair == nil)
             .keyboardShortcut("s", modifiers: .command)
 
+            Button { model.startCompare() } label: {
+                Label("Compare", systemImage: "rectangle.split.2x1")
+            }
+            .controlSize(.large)
+            .help("See what is different between the two folders. Nothing is changed.")
+            .disabled(model.isBusy || model.selectedPair == nil)
+            .keyboardShortcut("d", modifiers: .command)
+
             Picker("Pair", selection: $model.selectedPairID) {
                 if model.availablePairs.isEmpty {
                     Text("No pairs available").tag(UUID?.none)
@@ -71,7 +91,7 @@ struct ContentView: View {
                 }
             }
             .labelsHidden()
-            .frame(minWidth: 240, maxWidth: 400)
+            .frame(minWidth: 180, maxWidth: 400)
             .disabled(model.isBusy)
 
             Button { model.refreshAvailability(manual: true) } label: {
@@ -82,65 +102,6 @@ struct ContentView: View {
 
             Spacer(minLength: 0)
         }
-    }
-
-    // MARK: Progress
-
-    private var progressPanel: some View {
-        GroupBox {
-            VStack(alignment: .leading, spacing: 8) {
-                if let p = model.progress {
-                    HStack {
-                        Text(p.phase).font(.headline)
-                        Spacer()
-                        if let f = p.fraction {
-                            Text(f.formatted(.percent.precision(.fractionLength(0))))
-                                .font(.headline).monospacedDigit()
-                        }
-                        if model.isBusy {
-                            Button("Cancel", role: .destructive) { model.cancelSync() }
-                                .controlSize(.small)
-                        }
-                    }
-                    if let f = p.fraction, !(model.isBusy && p.phase.hasPrefix("Verifying")) {
-                        ProgressView(value: f)
-                    } else {
-                        ProgressView().progressViewStyle(.linear)
-                    }
-                    HStack(spacing: 14) {
-                        if p.bytesTotal > 0 {
-                            stat("arrow.down.doc", "\(Fmt.bytes(p.bytesDone)) of \(Fmt.bytes(p.bytesTotal))")
-                            stat("speedometer", model.isBusy ? Fmt.rate(p.bytesPerSecond) : "—")
-                            if model.isBusy, let eta = p.secondsRemaining {
-                                stat("clock", "about \(Fmt.duration(eta)) left")
-                            }
-                        }
-                        if p.itemsTotal > 0 {
-                            stat("checklist", "\(p.itemsDone) of \(p.itemsTotal) items")
-                        }
-                        Spacer(minLength: 0)
-                    }
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    Text(p.currentItem.isEmpty ? " " : p.currentItem)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                } else {
-                    Text("Ready").font(.headline)
-                    ProgressView(value: 0)
-                    Text("Choose a pair from the drop-down and press Sync Pair. Progress and transfer speed show here.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .padding(6)
-        }
-    }
-
-    private func stat(_ symbol: String, _ text: String) -> some View {
-        Label(text, systemImage: symbol).monospacedDigit()
     }
 
     // MARK: Pairs list
@@ -247,7 +208,11 @@ struct ContentView: View {
                 Text("latest \(AppModel.visibleLogLines) · refreshes every \(AppModel.logRefreshEvery) entries")
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
+                Toggle("Always compare before syncing", isOn: $compareFirst)
+                    .toggleStyle(.checkbox).controlSize(.small)
                 Text("Version \(Fmt.appVersion)").font(.caption).foregroundStyle(.secondary)
+                Button(model.isCheckingUpdate ? "Checking…" : "Check for Updates") { model.checkForUpdates() }
+                    .controlSize(.small).disabled(model.isCheckingUpdate)
                 Button("Open Full Log") { model.openFullLog() }.controlSize(.small)
             }
             GroupBox {
@@ -278,6 +243,69 @@ struct ContentView: View {
         case .warning: return .orange
         case .error: return .red
         }
+    }
+}
+
+// MARK: - Progress
+
+struct ProgressPanel: View {
+    let model: AppModel
+
+    var body: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 8) {
+                if let p = model.progress {
+                    HStack {
+                        Text(p.phase).font(.headline)
+                        Spacer()
+                        if let f = p.fraction {
+                            Text(f.formatted(.percent.precision(.fractionLength(0))))
+                                .font(.headline).monospacedDigit()
+                        }
+                        if model.isBusy {
+                            Button("Cancel", role: .destructive) { model.cancelSync() }
+                                .controlSize(.small)
+                        }
+                    }
+                    if let f = p.fraction, !(model.isBusy && p.phase.hasPrefix("Verifying")) {
+                        ProgressView(value: f)
+                    } else {
+                        ProgressView().progressViewStyle(.linear)
+                    }
+                    HStack(spacing: 14) {
+                        if p.bytesTotal > 0 {
+                            stat("arrow.down.doc", "\(Fmt.bytes(p.bytesDone)) of \(Fmt.bytes(p.bytesTotal))")
+                            stat("speedometer", model.isBusy ? Fmt.rate(p.bytesPerSecond) : "—")
+                            if model.isBusy, let eta = p.secondsRemaining {
+                                stat("clock", "about \(Fmt.duration(eta)) left")
+                            }
+                        }
+                        if p.itemsTotal > 0 {
+                            stat("checklist", "\(p.itemsDone) of \(p.itemsTotal) items")
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    Text(p.currentItem.isEmpty ? " " : p.currentItem)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                } else {
+                    Text("Ready").font(.headline)
+                    ProgressView(value: 0)
+                    Text("Choose a pair from the drop-down and press Sync Pair, or Compare to look first. Progress and transfer speed show here.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(6)
+        }
+    }
+
+    private func stat(_ symbol: String, _ text: String) -> some View {
+        Label(text, systemImage: symbol).monospacedDigit()
     }
 }
 
