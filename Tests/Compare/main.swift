@@ -189,14 +189,16 @@ check(rd(A, "q.txt") == "newer!" && rd(B, "q_past.txt") == "older", "as in v1.0"
 fresh("14 a v1.0 sync record still works")
 w(A, "r.txt", "r", 9000); doSync()
 for d in [A, B] { let f = try! fm.contentsOfDirectory(atPath: d.path).first { $0.hasPrefix(".projectdrivesync-") }!
-    var j = try! JSONSerialization.jsonObject(with: Data(contentsOf: d.appendingPathComponent(f))) as! [String: Any]; j["demoted"] = nil
+    var j = try! JSONSerialization.jsonObject(with: Data(contentsOf: d.appendingPathComponent(f))) as! [String: Any]; j["demoted"] = nil; j["pasts"] = nil
     try! JSONSerialization.data(withJSONObject: j).write(to: d.appendingPathComponent(f)) }
-rm(A, "r.txt"); s = doSync(); check(!s.mergeMode && !ex(B, "r.txt"), "record read, deletion carried over")
+rm(A, "r.txt"); s = doSync(); check(!s.mergeMode && ex(B, "r.txt"), "record read; a deletion from a 1.0 record waits to be confirmed")
+apply(look(), ["f:r.txt": .deleteBoth]); check(!ex(B, "r.txt"), "then it is carried over")
 
 fresh("15 any deletion is shown first")
 for i in 0..<200 { w(A, "f\(i).txt", "x\(i)", 9000) }; doSync(); rm(A, "f3.txt")
-check(try! eng().prepare().summary.needsConfirmation, "one deletion among 200 asks"); doSync(); w(A, "f5.txt", "edit", 10)
-check(!(try! eng().prepare().summary.needsConfirmation), "an ordinary edit doesn't ask")
+func asks() -> Bool { let e = eng(); let p = try! e.prepare(); e.releaseLocks(); return p.summary.needsConfirmation }
+check(asks(), "one deletion among 200 asks"); doSync(); w(A, "f5.txt", "edit", 10)
+check(!asks(), "an ordinary edit doesn't ask")
 
 fresh("16 each drive's map lists that drive")
 w(A, "a.txt", "a", 9000); doSync(); w(B, "only-b.txt", "b", 100); apply(look(), ["f:only-b.txt": .skip])
@@ -222,6 +224,95 @@ pkg(A, "base", 9000); doSync(); pkg(A, "from A", 600); pkg(B, "from B!", 500)
 check(kind(look(), "f:l.rtfd") == .clash, "package clash"); apply(look(), ["f:l.rtfd": .keepBoth])
 let lk = try! fm.contentsOfDirectory(atPath: A.path).first { $0.hasPrefix("L (") } ?? "none"
 check(rd(A, "L.rtfd/TXT.rtf") == "from B!" && rd(B, lk + "/TXT.rtf") == "from A" && rd(A, lk + "/TXT.rtf") == "from A", "both packages on both drives (\(lk))")
+
+// ---- Cases proven by the independent review ----
+func mv(_ d: URL, _ a: String, _ b: String) { try! fm.moveItem(at: d.appendingPathComponent(a), to: d.appendingPathComponent(b)) }
+func lock(_ u: URL, _ on: Bool) { try! fm.setAttributes([.immutable: on], ofItemAtPath: u.path) }
+func settled() -> Bool { look().items.allSatisfy { $0.kind == .unchanged } }
+func trashEmpty() -> Bool { ((try? fm.contentsOfDirectory(atPath: T.path)) ?? []).isEmpty }
+func v12() { w(A, "r.txt", "v1", 9000); doSync(); w(A, "r.txt", "v2", 8000); doSync() }
+
+fresh("R1 renaming to or from _past is not a deletion")
+w(A, "r.txt", "precious", 9000); w(A, "Notes_past.pdf", "notes", 9000); doSync(); mv(B, "r.txt", "r_past.txt"); mv(A, "Notes_past.pdf", "Notes.pdf"); s = doSync()
+check(s.deletions == 0 && trashEmpty() && rd(A, "r.txt") == "precious" && rd(B, "r.txt") == "precious", "r.txt safe on both")
+check(rd(A, "Notes.pdf") == "notes" && rd(B, "Notes.pdf") == "notes", "rename carried over"); check(settled(), "settled")
+
+fresh("R2 half-finished update is not a deletion")
+w(A, "r.txt", "base", 9000); doSync(); mv(B, "r.txt", "r_past.txt"); w(B, "r_past.txt", "B replacement", 9500); s = doSync()
+check(s.deletions == 0 && trashEmpty() && rd(A, "r.txt") == "base", "nothing trashed")
+fresh("R2b locked file: copies over, unlocked, nothing left behind")
+w(A, "r.txt", "v1", 9000); doSync(); w(A, "r.txt", "v2", 500); lock(A.appendingPathComponent("r.txt"), true); doSync()
+check(rd(B, "r.txt") == "v2" && rd(B, "r_past.txt") == "v1" && noLeftovers(), "synced"); lock(A.appendingPathComponent("r.txt"), false); check(settled(), "settled")
+fresh("R2c a placement that can't happen is rolled back")
+w(A, "r.txt", "v1", 9000); doSync(); w(A, "r.txt", "v2", 500)
+var re = eng()
+let sub = SyncEngine(pair: pair, logDirectory: nil, log: { if $0.text.contains("Renamed r.txt") { try! "in the way".write(to: B.appendingPathComponent("r.txt"), atomically: false, encoding: .utf8) } }, progress: { _ in }); sub.trashOverride = T
+p = try! sub.prepare(); let rr = try! sub.execute(p)
+check(rr.errors == 1 && rd(B, "r.txt") == "in the way" && rd(B, "r_past.txt") == "v1" && rd(A, "r.txt") == "v2", "every file still there"); check(noLeftovers(), "no leftovers")
+
+fresh("R3 unsynced _past edits are never retired silently")
+v12(); w(A, "r.txt", "v3", 200); w(B, "r_past.txt", "B edit of past", 100); doSync()
+check(rd(B, "r_past.txt") == "B edit of past" && rd(A, "r.txt") == "v3" && !trashed("B edit of past"), "edit on one, _past edit on the other: left alone")
+fresh("R3b"); v12(); w(A, "r.txt", "v3", 200); w(A, "r_past.txt", "A edit of past", 100); doSync(); check(rd(A, "r_past.txt") == "A edit of past" && !trashed("A edit of past"), "both on one drive")
+fresh("R3c"); v12(); w(A, "r_past.txt", "past on A", 200); w(B, "r_past.txt", "past on B!", 100); doSync()
+check(rd(A, "r_past.txt") == "past on A" && rd(B, "r_past.txt") == "past on B!" && rd(A, "r.txt") == "v2" && trashEmpty(), "different _past edits")
+mv(A, "r_past.txt", "r other.txt"); doSync(); check(ex(B, "r other.txt"), "renaming one clears it"); doSync(); check(settled(), "settled")
+fresh("R4 _past edited while the current is deleted elsewhere"); v12(); w(A, "r_past.txt", "my new edit", 100); rm(B, "r.txt"); s = doSync(); check(s.deletions == 0 && !trashed("my new edit"), "not treated as a deletion")
+
+fresh("R5 an hour apart is a different version"); w(A, "db.dat", "1111", 9000); doSync(); w(A, "db.dat", "2222", 9000 - 3600); doSync(); check(rd(B, "db.dat") == "2222", "edit synced")
+w(A, "c.dat", "0000", 9000); doSync(); w(A, "c.dat", "AAAA", 5000); w(B, "c.dat", "BBBB", 1400); check(kind(look(), "f:c.dat") == .clash, "clash seen")
+fresh("R5b FAT32 daylight saving"); w(A, "f.txt", "same", 9000); doSync(); w(B, "f.txt", "same", 9000 - 3600)
+func fatLook() -> SyncPlan { let e = eng(); e.fatOverride = true; return try! e.prepare(readOnly: true) }
+check(kind(fatLook(), "f:f.txt") == .unchanged, "same contents, shifted an hour"); w(B, "f.txt", "diff", 9000 - 3600); check(kind(fatLook(), "f:f.txt") != .unchanged, "different contents are not hidden")
+
+fresh("R6 aliases are not deletions and are never written through")
+w(A, "Photos/p.jpg", "p", 9000); w(A, "r.txt", "r", 9000); doSync()
+let outside = A.deletingLastPathComponent().appendingPathComponent("outside"); try! fm.createDirectory(at: outside, withIntermediateDirectories: true)
+try! fm.moveItem(at: A.appendingPathComponent("Photos"), to: outside.appendingPathComponent("Photos")); try! fm.moveItem(at: A.appendingPathComponent("r.txt"), to: outside.appendingPathComponent("r.txt"))
+try! fm.createSymbolicLink(at: A.appendingPathComponent("Photos"), withDestinationURL: outside.appendingPathComponent("Photos")); try! fm.createSymbolicLink(at: A.appendingPathComponent("r.txt"), withDestinationURL: outside.appendingPathComponent("r.txt"))
+w(B, "Photos/new.jpg", "n", 100); doSync()
+check(rd(B, "Photos/p.jpg") == "p" && rd(B, "r.txt") == "r", "nothing deleted"); check(!fm.fileExists(atPath: outside.appendingPathComponent("Photos/new.jpg").path), "nothing written outside the folder")
+check(kind(look(), "f:r.txt") == .blocked, "shown as left alone")
+
+fresh("R7 a change with an older date is a choice, not undone")
+w(A, "r.txt", "base", -86400); doSync(); w(B, "r.txt", "edit one", 200); s = doSync(); check(s.clashes == 1 && rd(B, "r.txt") == "edit one" && rd(A, "r.txt") == "base", "asked")
+w(B, "r.txt", "edit two!", 100); doSync(); check(rd(B, "r.txt") == "edit two!" && trashEmpty(), "second edit kept too"); apply(look(), ["f:r.txt": .keepB]); check(rd(A, "r.txt") == "edit two!" && rd(A, "r_past.txt") == "base", "chosen"); doSync(); check(rd(A, "r.txt") == "edit two!" && settled(), "and it sticks")
+
+fresh("R8 a.txt_past is its own document"); w(A, "a.txt", "a1", 9000); w(A, "a_past.txt", "a0", 9500); w(A, "a.txt_past", "my other file", 9000); doSync(); w(A, "a.txt", "a2", 100); doSync()
+check(rd(A, "a.txt_past") == "my other file" && rd(B, "a.txt_past") == "my other file" && rd(B, "a_past.txt") == "a1", "kept")
+
+fresh("R9 put back while waiting: not deleted"); w(A, "r.txt", "r", 9000); w(A, "d/x.txt", "x", 9000); doSync(); rm(B, "r.txt"); rm(B, "d")
+re = eng(); p = try! re.prepare(); w(B, "r.txt", "r", 9000); w(B, "d/x.txt", "x", 9000); _ = try! re.execute(p); doSync()
+check(rd(A, "r.txt") == "r" && rd(B, "r.txt") == "r" && rd(A, "d/x.txt") == "x" && rd(B, "d/x.txt") == "x", "still on both")
+
+fresh("R10 keeping the older survives a cancel"); w(A, "r.txt", "old", 9000); w(A, "z.txt", "z", 9000); doSync(); w(B, "r.txt", "newer", 500); w(B, "z.txt", "z2", 400); 
+var rv = SyncEngine.review(of: look()); rv.decisions["f:r.txt"] = .keepA
+var hold10: SyncEngine?; let c10 = SyncEngine(pair: pair, logDirectory: nil, log: { if $0.text.contains("r_past.txt") && $0.text.contains("[A]") || $0.text.contains("Copied newest r.txt") { hold10?.cancel() } }, progress: { _ in }); c10.trashOverride = T; hold10 = c10
+let cp = try! c10.prepare(review: rv); var didCancel = false; do { _ = try c10.execute(cp) } catch { didCancel = true }
+doSync(); check(didCancel && rd(A, "r.txt") == "old" && rd(B, "r.txt") == "old" && rd(A, "r_past.txt") == "newer", "older still current after cancel and another sync")
+
+fresh("R11 a lost record doesn't decide a clash"); w(A, "r.txt", "base", 9000); doSync(); w(A, "r.txt", "A edit", 600); w(B, "r.txt", "B edit!", 500)
+for f in try! fm.contentsOfDirectory(atPath: B.path) where f.hasPrefix(".projectdrivesync-") { rm(B, f) }
+s = doSync(); check(rd(A, "r.txt") == "A edit" && rd(B, "r.txt") == "B edit!" && s.clashes == 1, "still asks")
+
+fresh("R12 nothing is deleted when a copy failed"); w(A, "r.txt", "r", 9000); doSync(); mv(A, "r.txt", "s.txt")
+try! fm.setAttributes([.posixPermissions: 0], ofItemAtPath: A.appendingPathComponent("s.txt").path)
+if (try? Data(contentsOf: A.appendingPathComponent("s.txt"))) == nil { doSync(); check(rd(B, "r.txt") == "r", "B keeps its copy") }
+try! fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: A.appendingPathComponent("s.txt").path); doSync(); check(rd(B, "s.txt") == "r" && !ex(B, "r.txt"), "then the rename carries over")
+
+fresh("R13 documents really named _past keep their name"); w(A, "Notes_past.pdf", "n1", 9000); w(A, "x.txt", "X doc", 9000); w(A, "x_past_past.txt", "other", 9000); doSync(); w(A, "Notes_past.pdf", "n2", 500); w(A, "x_past_past.txt", "other 2", 400); doSync(); doSync()
+check(rd(B, "Notes_past.pdf") == "n2" && !ex(B, "Notes.pdf"), "edited in place"); check(rd(A, "x.txt") == "X doc" && rd(B, "x_past_past.txt") == "other 2", "neighbours untouched"); check(settled(), "settled")
+
+fresh("R14 the same edit on both keeps the real _past"); v12(); w(A, "r.txt", "same!", 600); w(B, "r.txt", "same!", 500); doSync(); check(rd(A, "r_past.txt") == "v1" && rd(B, "r_past.txt") == "v1" && settled(), "the earlier version is kept, not a duplicate")
+fresh("R15 a folder that became a package on one drive"); w(A, "X.bundle_/a.txt", "a", 9000); doSync(); rm(A, "X.bundle_"); w(A, "X.bundle_", "now a file", 500); doSync(); check(rd(B, "X.bundle_/a.txt") == "a", "contents on the other drive untouched")
+fresh("R16 two copies of the app"); w(A, "a.txt", "a", 9000); re = eng(); _ = try! re.prepare(); check((try? eng().prepare()) == nil, "second one is refused"); check((try? eng().prepare(readOnly: true)) != nil, "looking is still allowed"); re.releaseLocks(); check((try? eng().prepare()) != nil, "free afterwards")
+
+fresh("R17 names that differ only in capitals"); w(B, "ab.txt", "one", 900); doSync(); w(B, "AB.txt", "other document", 200)
+if (try! fm.contentsOfDirectory(atPath: B.path)).filter({ $0.lowercased() == "ab.txt" }).count == 2 {
+    w(B, "docs/a.txt", "d1", 300); w(B, "Docs/a.txt", "D2", 200); doSync(); doSync()
+    check(rd(B, "ab.txt") == "one" && rd(B, "AB.txt") == "other document" && rd(B, "docs/a.txt") == "d1" && rd(B, "Docs/a.txt") == "D2" && trashEmpty(), "all left alone")
+    check(kind(look(), "f:ab.txt") == .blocked, "shown as left alone")
+} else { print("  (skipped: this drive ignores capitals)") }
 
 print(failures == 0 ? "\nALL PASSED (\(passes))" : "\n\(failures) FAILURE(S)")
 exit(failures == 0 ? 0 : 1)

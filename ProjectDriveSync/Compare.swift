@@ -24,13 +24,14 @@ nonisolated enum DiffKind: Sendable, Equatable {
     case deletedButChanged  // gone from one drive but edited on the other
     case edited             // one drive has an edit the other doesn't
     case clash              // both drives have edits the other doesn't
+    case olderCopy          // one drive changed, but to something with an older date
     case onlyHere           // on one drive, and there is no sync record to say why
     case differs            // different on each drive, and there is no sync record
     case tidy               // current files match; _past files don't
     case blocked            // can't be synced (name problem, unreadable)
 
     var isChange: Bool { self != .unchanged }
-    var needsReview: Bool { self == .clash || self == .blocked }
+    var needsReview: Bool { self == .clash || self == .olderCopy || self == .blocked }
 }
 
 nonisolated struct SideInfo: Sendable, Equatable {

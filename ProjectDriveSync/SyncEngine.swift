@@ -48,7 +48,9 @@ nonisolated enum Naming {
         let suffix = SyncConstants.pastSuffix
         // Case-insensitive, like the drives themselves: "Plan_Past.docx" is the previous version.
         if stem.count > suffix.count && stem.lowercased().hasSuffix(suffix) {
-            return (join(String(stem.dropLast(suffix.count)), ext), .past)
+            let logical = join(String(stem.dropLast(suffix.count)), ext)
+            // Only a name this app would give it: "a.txt_past" is not the previous version of "a.txt".
+            if key(name(logical: logical, role: .past)) == key(fileName) { return (logical, .past) }
         }
         return (fileName, .updated)
     }
@@ -108,6 +110,7 @@ nonisolated struct FileVariant: Sendable, Hashable {
 
     var fileName: String { Naming.lastComponent(relPath) }
 
+    /// Same size and date. The engine's `same` also handles FAT32 drives.
     func sameVersion(as other: FileVariant) -> Bool {
         size == other.size && Self.sameTime(mtime, other.mtime)
     }
@@ -116,11 +119,8 @@ nonisolated struct FileVariant: Sendable, Hashable {
         size == stamp.size && Self.sameTime(mtime, stamp.mtime)
     }
 
-    /// Equal within 2 s, or exactly one hour apart: FAT32 drives store local time, so a daylight-saving
-    /// change shifts every file on them by an hour.
     static func sameTime(_ a: Date, _ b: Date) -> Bool {
-        let d = abs(a.timeIntervalSince(b))
-        return d <= SyncConstants.timeTolerance || abs(d - 3600) <= SyncConstants.timeTolerance
+        abs(a.timeIntervalSince(b)) <= SyncConstants.timeTolerance
     }
 }
 
@@ -144,6 +144,8 @@ nonisolated struct SideScan: Sendable {
     var recovered: [String] = []
     /// Documents with a file still parked by an interrupted sync (seen by a read-only check).
     var parkedKeys: Set<String> = []
+    /// Keys that must be left alone on both drives, and why (aliases, two names that differ only in case).
+    var leaveAlone: [String: String] = [:]
     var totalBytes: Int64 = 0
     var fileCount = 0
 }
@@ -164,6 +166,8 @@ nonisolated struct SyncState: Codable, Sendable {
     var folders: [String]
     /// A _past version the user chose to keep behind an older current one, although its date is newer.
     var demoted: [String: VersionStamp]? = nil
+    /// The _past version at the last sync. Missing in records written by 1.0.
+    var pasts: [String: VersionStamp]? = nil
 }
 
 // MARK: - Plan model
@@ -211,6 +215,11 @@ nonisolated struct DeleteOp: Sendable {
     var expectedFiles: [String: FileVariant] = [:]
     /// For folders: every subfolder the plan saw (lower-cased keys).
     var expectedFolders: Set<String> = []
+    /// Everything with the same group is deleted together or not at all.
+    var group = ""
+    /// These must still be missing, otherwise it wasn't deleted after all.
+    var mustBeAbsent: [Absent] = []
+    struct Absent: Sendable { var side: Side; var parentKey: String; var parentRel: String; var name: String }
 }
 
 nonisolated struct PlanSummary: Sendable {
@@ -256,7 +265,7 @@ nonisolated struct PlanSummary: Sendable {
             l.append("\(filesToDelete) document(s) and \(foldersToDelete) folder(s) that were deleted in one location since the last sync will be moved to the Trash in the other.")
         }
         if keptChanged > 0 { l.append("\(keptChanged) item(s) deleted in one location but changed in the other will be kept and restored.") }
-        if clashes > 0 { l.append("\(clashes) document(s) were edited on both drives. They are left alone until you choose what to keep.") }
+        if clashes > 0 { l.append("\(clashes) document(s) need your choice (edited on both drives, or replaced by an older copy). They are left alone until you choose.") }
         if keepBoth > 0 { l.append("\(keepBoth) document(s) will be kept as two separate files.") }
         if skipped > 0 { l.append("\(skipped) item(s) skipped this time.") }
         if heldBack > 0 { l.append("\(heldBack) item(s) changed after you looked, so they are held back. Compare again to see them.") }
@@ -277,6 +286,8 @@ nonisolated struct SyncPlan: Sendable {
     var items: [DiffItem] = []
     /// Newer versions the user chose to put behind an older current one (document key -> stamp).
     var demote: [String: VersionStamp] = [:]
+    /// Such choices made earlier.
+    var demoted: [String: VersionStamp] = [:]
     /// "Do this now" touches only some items.
     var partial = false
     var summary = PlanSummary()
@@ -377,7 +388,10 @@ nonisolated final class SyncEngine: @unchecked Sendable {
         }
     }
 
-    deinit { try? logHandle?.close() }
+    deinit {
+        try? logHandle?.close()
+        releaseLocks()
+    }
 
     // MARK: Cancellation
 
@@ -505,6 +519,7 @@ nonisolated final class SyncEngine: @unchecked Sendable {
                 continue
             }
             if name.hasPrefix(SyncConstants.tempPrefix) {
+                Self.unlock(item)
                 try? fm.removeItem(at: item)
                 touched = true
             } else if name.hasPrefix(SyncConstants.holdPrefix) {
@@ -546,11 +561,19 @@ nonisolated final class SyncEngine: @unchecked Sendable {
             }
             if values.isSymbolicLink == true {
                 result.skipped.append(childRel + " (alias/symlink)")
+                let why = "It is an alias (symbolic link) on one drive."
+                result.leaveAlone[Naming.key(childRel)] = why
+                result.leaveAlone[Naming.joinPath(Naming.key(rel), Naming.key(Naming.parse(name).logical))] = why
                 continue
             }
             let isDir = values.isDirectory == true
             let isPackage = isDir && values.isPackage == true
             if isDir && !isPackage {
+                if let other = result.folders[Naming.key(childRel)] {
+                    result.leaveAlone[Naming.key(childRel)] = "Two folders differ only in capital letters or accents (\(other)). Rename one."
+                    result.skipped.append(childRel + " (same name as \(other))")
+                    continue
+                }
                 result.folders[Naming.key(childRel)] = childRel
                 try walk(dir: item, rel: childRel, depth: depth + 1, rootName: rootName, readOnly: readOnly, into: &result)
                 continue
@@ -564,6 +587,9 @@ nonisolated final class SyncEngine: @unchecked Sendable {
             let variant = FileVariant(relPath: childRel, role: role, size: size, mtime: mtime, isPackage: isPackage)
             if result.files[key] == nil {
                 result.files[key] = LogicalFile(key: key, parentKey: parentKey, parentRel: rel, logicalName: logical, variants: [])
+            }
+            if let other = result.files[key]!.variants.first(where: { $0.role == role }) {
+                result.leaveAlone[key] = "Two files differ only in capital letters or accents (\(other.fileName) and \(name)). Rename one."
             }
             result.files[key]!.variants.append(variant)
             result.totalBytes += size
@@ -598,10 +624,78 @@ nonisolated final class SyncEngine: @unchecked Sendable {
         return try? JSONDecoder().decode(SyncState.self, from: data)
     }
 
-    private func writeState(_ state: SyncState, _ side: Side) throws {
+    /// Written to temporary files on both drives first, so a drive that can't be written leaves both old records.
+    private func writeStates(_ state: SyncState) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        try encoder.encode(state).write(to: stateURL(side), options: .atomic)
+        let data = try encoder.encode(state)
+        var temps: [(URL, URL)] = []
+        defer { for (t, _) in temps where fm.fileExists(atPath: t.path) { try? fm.removeItem(at: t) } }
+        for side in Side.allCases {
+            let tmp = root(side).appendingPathComponent(SyncConstants.tempPrefix + UUID().uuidString)
+            temps.append((tmp, stateURL(side)))
+            try data.write(to: tmp)
+        }
+        for (tmp, final) in temps {
+            guard rename(tmp.path, final.path) == 0 else { throw posixFailure("save", final) }
+        }
+    }
+
+    // MARK: - One sync at a time, on the drives it started with
+
+    private var lockHandles: [Int32] = []
+    private var devices: [dev_t?] = [nil, nil]
+
+    private func device(_ side: Side) -> dev_t? {
+        var st = stat()
+        return stat(root(side).path, &st) == 0 ? st.st_dev : nil
+    }
+
+    private func takeLocks() throws {
+        guard lockHandles.isEmpty else { return }
+        for side in Side.allCases {
+            let path = root(side).appendingPathComponent(".projectdrivesync.lock").path
+            let fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW, 0o666)
+            guard fd >= 0 else { continue }  // e.g. a read-only drive: the sync itself will say so
+            _ = fchmod(fd, 0o666)
+            if flock(fd, LOCK_EX | LOCK_NB) != 0 {
+                let busy = errno == EWOULDBLOCK
+                close(fd)
+                if busy { throw SyncError.failed("Another copy of Project Drive Sync is using \(root(side).path). Try again when it has finished.") }
+                continue
+            }
+            lockHandles.append(fd)
+        }
+    }
+
+    /// Called when a run ends, or when a prepared plan won't be carried out.
+    func releaseLocks() {
+        for fd in lockHandles { close(fd) }
+        lockHandles = []
+    }
+
+    private static func unlock(_ url: URL) {
+        var st = stat()
+        guard lstat(url.path, &st) == 0 else { return }
+        let locks = UInt32(UF_IMMUTABLE | UF_APPEND)
+        if st.st_flags & locks != 0 { _ = lchflags(url.path, st.st_flags & ~locks) }
+    }
+
+    /// FAT32 keeps local time, so a daylight-saving change moves its dates by an hour.
+    var fatOverride: Bool?
+    private lazy var usesFAT: Bool = fatOverride ?? Side.allCases.contains { side in
+        var fs = statfs()
+        guard statfs(root(side).path, &fs) == 0 else { return false }
+        return withUnsafeBytes(of: fs.f_fstypename) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) } == "msdos"
+    }
+
+    /// The same version on two drives. Exactly an hour apart counts only on FAT32, and only if the contents match.
+    private func same(_ x: FileVariant, _ sx: Side, _ y: FileVariant, _ sy: Side) -> Bool {
+        guard x.size == y.size else { return false }
+        if FileVariant.sameTime(x.mtime, y.mtime) { return true }
+        guard sx != sy, usesFAT,
+              abs(abs(x.mtime.timeIntervalSince(y.mtime)) - 3600) <= SyncConstants.timeTolerance else { return false }
+        return sameContents(url(sx, x.relPath), url(sy, y.relPath), limit: .max)
     }
 
     // MARK: - Prepare (scan + plan)
@@ -609,6 +703,11 @@ nonisolated final class SyncEngine: @unchecked Sendable {
     /// `readOnly` only looks: nothing on either drive is touched.
     func prepare(readOnly: Bool = false, review: Review? = nil) throws -> SyncPlan {
         progress = SyncProgress()
+        for side in Side.allCases {
+            guard PairStore.isDirectory(root(side).path) else { throw SyncError.locationMissing(root(side).path) }
+            devices[side.rawValue] = device(side)
+        }
+        if !readOnly { try takeLocks() }
         setPhase("Scanning location A…", indeterminate: true)
         log("Scanning A: \(root(.a).path)")
         let scanA = try scan(.a, readOnly: readOnly)
@@ -639,7 +738,9 @@ nonisolated final class SyncEngine: @unchecked Sendable {
         if let review, review.syncID != trusted?.syncID {
             throw SyncError.failed("This pair was synced after you compared it, so nothing was changed. Compare again.")
         }
-        var plan = buildPlan(scans: [scanA, scanB], state: trusted, review: review)
+        var plan = buildPlan(scans: [scanA, scanB], state: trusted, review: review,
+                             demoted: (stateB?.demoted ?? [:]).merging(stateA?.demoted ?? [:]) { $1 },
+                             anyRecord: stateA != nil || stateB != nil)
         plan.summary.pairName = pair.name
         for note in plan.notes.prefix(30) { log(note, .warning) }
         if plan.notes.count > 30 { log("…and \(plan.notes.count - 30) more notes (see full log)", .warning) }
@@ -657,7 +758,7 @@ nonisolated final class SyncEngine: @unchecked Sendable {
     private func groupVersions(_ instances: [(side: Side, variant: FileVariant)], demoted: VersionStamp? = nil) -> [Version] {
         var versions: [Version] = []
         for inst in instances.sorted(by: { $0.variant.mtime > $1.variant.mtime }) {
-            if let i = versions.firstIndex(where: { $0.rep.sameVersion(as: inst.variant) }) {
+            if let i = versions.firstIndex(where: { same($0.rep, $0.instances[0].side, inst.variant, inst.side) }) {
                 versions[i].instances.append(inst)
             } else {
                 versions.append(Version(rep: inst.variant, instances: [inst]))
@@ -676,9 +777,13 @@ nonisolated final class SyncEngine: @unchecked Sendable {
 
     /// Decides what every document and folder needs, and why. The comparison tree and the sync are both
     /// built from this one result, so they can't disagree.
-    func buildPlan(scans: [SideScan], state: SyncState?, review: Review? = nil) -> SyncPlan {
+    func buildPlan(scans: [SideScan], state: SyncState?, review: Review? = nil, demoted: [String: VersionStamp] = [:],
+                   anyRecord: Bool = false) -> SyncPlan {
         var plan = SyncPlan(scans: scans, oldState: state)
         plan.partial = review?.limit != nil
+        plan.demoted = demoted
+        let oldFormat = state != nil && state?.pasts == nil   // written by 1.0
+        let leaveAlone = scans[0].leaveAlone.merging(scans[1].leaveAlone) { a, _ in a }
         plan.summary.mergeMode = (state == nil)
         plan.summary.unreadable = scans.reduce(0) { $0 + $1.unreadable.count }
         // If anything couldn't be read, a missing item might just be unreadable: delete nothing this time.
@@ -689,16 +794,23 @@ nonisolated final class SyncEngine: @unchecked Sendable {
         }
         let stateFolders = Set(state?.folders ?? [])
         let unreadableKeys = Set(scans.flatMap(\.unreadable).map(Naming.key))
+        var conflictKeys = Set<String>()
         let parked = scans[0].parkedKeys.union(scans[1].parkedKeys)
         let labels = Place.labels(pair)
         func label(_ s: Side) -> String { s == .a ? labels.a : labels.b }
         func underUnreadable(_ key: String) -> Bool {
             !unreadableKeys.isEmpty && (unreadableKeys.contains(key) || Naming.ancestors(of: key).contains { unreadableKeys.contains($0) })
         }
+        func leftAlone(_ key: String) -> String? {
+            if leaveAlone.isEmpty { return nil }
+            return leaveAlone[key] ?? Naming.ancestors(of: key).lazy.compactMap { leaveAlone[$0] }.first
+        }
+        func insideConflict(_ key: String) -> Bool { Naming.ancestors(of: key).contains { conflictKeys.contains($0) } }
         /// The user's choice if it is one this item allows, otherwise the suggestion.
         func choice(_ id: String, _ suggested: Decision, _ allowed: [Decision]) -> Decision {
             if let limit = review?.limit, !limit.contains(id) { return .skip }
-            guard let d = review?.decisions[id] else { return suggested }
+            guard let review else { return suggested }
+            guard let d = review.decisions[id] else { return .skip }
             return allowed.contains(d) ? d : .skip
         }
         func info(_ f: LogicalFile?) -> SideInfo? {
@@ -716,7 +828,7 @@ nonisolated final class SyncEngine: @unchecked Sendable {
         /// Documents whose plan copies something to a side (that side needs the parent folders).
         var copiesTo: [String: Set<Side>] = [:]
         var pendingFileDeletes: [(key: String, side: Side, variants: [FileVariant])] = []
-        var conflictKeys = Set<String>()
+        var mustBeAbsent: [String: [DeleteOp.Absent]] = [:]
         var claimedNames = Set<String>()
 
         for key in allFileKeys.sorted() {
@@ -751,6 +863,8 @@ nonisolated final class SyncEngine: @unchecked Sendable {
                 block("The name is too long to add \"_past\". Shorten it.")
                 continue
             }
+            if insideConflict(key) { plan.summary.conflicts += 1; block("The folder it is in has the same name as a file or package on the other drive. Rename one."); continue }
+            if let why = leftAlone(key) { plan.summary.conflicts += 1; block(why); continue }
             if underUnreadable(key) { block("It, or the folder it is in, couldn't be read on one drive."); continue }
             if parked.contains(key) { block("An interrupted sync left this document half renamed. Press Sync Pair to restore it."); continue }
 
@@ -766,8 +880,23 @@ nonisolated final class SyncEngine: @unchecked Sendable {
             var instances: [(side: Side, variant: FileVariant)] = []
             for v in fa?.variants ?? [] { instances.append((.a, v)) }
             for v in fb?.variants ?? [] { instances.append((.b, v)) }
-            var versions = groupVersions(instances, demoted: state?.demoted?[key])
+            var versions = groupVersions(instances, demoted: demoted[key])
             let stamp = state?.files[key]
+
+            // Versions holding work that was never synced. Nothing below may send one of these to the Trash
+            // unless the user asked for exactly that.
+            func unsynced(_ v: FileVariant) -> Bool {
+                guard let stamp else { return true }
+                if v.matches(stamp) { return false }
+                if v.role == .past, let d = demoted[key], v.matches(d) { return false }
+                if v.role == .past, let known = state?.pasts {
+                    return known[key].map { !v.matches($0) } ?? true
+                }
+                return v.role == .updated || v.mtime.timeIntervalSince(stamp.mtime) > SyncConstants.timeTolerance
+            }
+            let fresh = versions.filter { v in v.instances.allSatisfy { unsynced($0.variant) } }
+            let lone = !((fa?.variants ?? []) + (fb?.variants ?? [])).contains { $0.role == .updated }
+            var sameContent = false
 
             // ---- What happened?
             if let fa, let fb {
@@ -777,18 +906,20 @@ nonisolated final class SyncEngine: @unchecked Sendable {
                     // One drive has only the _past file left.
                     let present: Side = hasA ? .a : .b
                     let keep = hasA ? ca : cb, rest = hasA ? fb : fa
-                    let nothingNewer = stamp.map { st in
-                        rest.variants.allSatisfy { $0.mtime.timeIntervalSince(st.mtime) <= SyncConstants.timeTolerance }
-                            || state?.demoted?[key].map { d in rest.variants.allSatisfy { $0.matches(d) } } == true
-                    } ?? false
+                    // A deletion leaves only _past files that both drives already had. Anything else is a rename,
+                    // an unfinished sync or an edit.
+                    let kept = hasA ? fa : fb
+                    let leftOnlyKnownPast = stamp != nil && fresh.isEmpty && rest.variants.allSatisfy { r in
+                        !r.matches(stamp!) && kept.variants.contains { $0.role == .past && same($0, present, r, present.other) }
+                    }
                     item.side = present
-                    if let stamp, keep.matches(stamp), nothingNewer {
+                    if let stamp, keep.matches(stamp), leftOnlyKnownPast {
                         item.kind = .deleted
                         item.reason = "Deleted on \(label(present.other)) (only its _past file is left) and unchanged on \(label(present)) since the last sync."
-                        item.suggested = canDelete ? .deleteBoth : .skip
+                        item.suggested = canDelete && !oldFormat ? .deleteBoth : .skip
                     } else if stamp != nil {
                         item.kind = .deletedButChanged
-                        item.reason = "The current file is gone from \(label(present.other)), but there are newer changes, so it is restored."
+                        item.reason = "\(label(present.other)) has no current file, only a _past one that is a rename or has other changes. The current file is put back."
                         item.suggested = .copyAcross
                     } else {
                         item.kind = .onlyHere
@@ -796,19 +927,19 @@ nonisolated final class SyncEngine: @unchecked Sendable {
                         item.suggested = .copyAcross
                     }
                     item.allowed = [.copyAcross, .deleteBoth, .skip]
-                } else if ca.sameVersion(as: cb) {
+                } else if same(ca, .a, cb, .b) {
                     item.kind = .tidy
-                    item.reason = versions[0].rep.sameVersion(as: ca)
+                    item.reason = versions[0].instances.contains { $0.side == .a && $0.variant == ca }
                         ? "The current files match. Only the _past files need lining up."
                         : "A _past file is newer than the current one, so the names will swap."
-                    item.suggested = .tidy
+                    item.suggested = stamp == nil && versions.count > 2 ? .skip : .tidy
                     item.allowed = [.tidy, .skip]
                 } else {
-                    let aFollowsB = fa.variants.contains { $0.role == .past && $0.sameVersion(as: cb) }
-                    let bFollowsA = fb.variants.contains { $0.role == .past && $0.sameVersion(as: ca) }
+                    let aFollowsB = fa.variants.contains { $0.role == .past && same($0, .a, cb, .b) }
+                    let bFollowsA = fb.variants.contains { $0.role == .past && same($0, .b, ca, .a) }
                     let newer: Side = ca.mtime >= cb.mtime ? .a : .b
                     let changedA = stamp.map { !ca.matches($0) }, changedB = stamp.map { !cb.matches($0) }
-                    item.allowed = [.keepA, .keepB, .keepBoth, .skip]
+                    item.allowed = lone ? [.keepBoth, .skip] : [.keepA, .keepB, .keepBoth, .skip]
                     if aFollowsB != bFollowsA {
                         item.side = aFollowsB ? .a : .b
                         item.kind = .edited
@@ -816,25 +947,31 @@ nonisolated final class SyncEngine: @unchecked Sendable {
                         item.suggested = item.side == .a ? .keepA : .keepB
                     } else if let changedA, let changedB, !(changedA && changedB) {
                         item.side = changedA ? .a : (changedB ? .b : newer)
-                        item.kind = .edited
                         if item.side == newer {
+                            item.kind = .edited
                             item.reason = "Edited on \(label(newer)) since the last sync; unchanged on \(label(newer.other))."
+                            item.suggested = newer == .a ? .keepA : .keepB
                         } else {
-                            item.reason = "\(label(item.side!)) now has an older copy than the one last synced. The newer one is kept unless you choose otherwise."
+                            item.kind = .olderCopy
+                            item.reason = "Changed on \(label(item.side!)) since the last sync, but its date is older than the copy on \(label(newer)). Choose which to use."
+                            item.suggested = .skip
                         }
-                        item.suggested = newer == .a ? .keepA : .keepB
-                    } else if state == nil && versions.count <= 2 {
+                        item.allowed = [.keepA, .keepB, .keepBoth, .skip]
+                    } else if state == nil && !anyRecord && versions.count <= 2 && !lone {
                         item.kind = .differs
                         item.side = newer
                         item.reason = "Different on each drive, with no sync record. The newer one becomes current and the other is kept as _past."
                         item.suggested = newer == .a ? .keepA : .keepB
                     } else if sameContents(url(.a, ca.relPath), url(.b, cb.relPath)) {
+                        sameContent = true
                         item.kind = .edited
                         item.side = newer
+                        item.allowed = [.keepA, .keepB, .skip]
                         item.reason = "The contents are the same on both drives; only the dates differ."
                         item.suggested = newer == .a ? .keepA : .keepB
                     } else {
                         item.kind = .clash
+                        if lone { item.allowed = [.keepBoth, .skip] }
                         item.reason = stamp == nil ? "Different on each drive, and there is no record of which follows which."
                                                    : "Edited on both drives since the last sync. Each has changes the other doesn't."
                         item.suggested = .skip
@@ -845,9 +982,9 @@ nonisolated final class SyncEngine: @unchecked Sendable {
                 item.side = present
                 item.allowed = [.copyAcross, .deleteBoth, .skip]
                 if let stamp {
-                    if versions[0].rep.matches(stamp) {
+                    if Self.current(lf).matches(stamp) && fresh.isEmpty {
                         item.kind = .deleted
-                        item.suggested = canDelete ? .deleteBoth : .skip
+                        item.suggested = canDelete && !oldFormat ? .deleteBoth : .skip
                         item.reason = "Deleted on \(label(present.other)) and unchanged on \(label(present)) since the last sync."
                     } else {
                         item.kind = .deletedButChanged
@@ -864,6 +1001,19 @@ nonisolated final class SyncEngine: @unchecked Sendable {
                     item.reason = "Only on \(label(present)). There is no sync record, so the app can't tell whether it is new or was deleted elsewhere."
                 }
             }
+            if oldFormat && item.kind == .deleted {
+                item.reason += " The last sync was made by version 1.0, so please confirm deletions this once."
+            }
+            // Separate edits that can't all be kept under name and name_past.
+            if stamp != nil, let fa, let fb, Self.hasCurrent(fa) == Self.hasCurrent(fb) {
+                let ca = Self.current(fa), cb = Self.current(fb)
+                let outside = fresh.filter { v in !v.instances.contains { ($0.side == .a && $0.variant == ca) || ($0.side == .b && $0.variant == cb) } }
+                if !outside.isEmpty && fresh.count > 1 {
+                    block("A _past file was edited as well as another version. Rename the edited _past file to keep it, then compare again.")
+                    plan.summary.conflicts += 1
+                    continue
+                }
+            }
             if !canDelete {
                 item.allowed.removeAll { $0 == .deleteBoth }
                 if item.kind == .deleted { item.reason += " Deletions are paused because some items couldn't be read." }
@@ -874,7 +1024,7 @@ nonisolated final class SyncEngine: @unchecked Sendable {
             func operations() -> [FileOp] {
                 Side.allCases.compactMap { side in
                     makeOp(side: side, file: lf, logicalName: logicalName,
-                           local: scans[side.rawValue].files[key]?.variants ?? [], versions: versions)
+                           local: scans[side.rawValue].files[key]?.variants ?? [], versions: versions, lone: lone)
                 }
             }
             if item.kind == .tidy && operations().isEmpty {
@@ -892,12 +1042,21 @@ nonisolated final class SyncEngine: @unchecked Sendable {
 
             switch decision {
             case .skip:
-                if item.kind == .clash { plan.summary.clashes += 1 } else { plan.summary.skipped += 1 }
+                if item.kind == .clash || item.kind == .olderCopy { plan.summary.clashes += 1 } else { plan.summary.skipped += 1 }
                 continue
             case .deleteBoth:
                 deletedFileKeys.insert(key)
                 if let fa { pendingFileDeletes.append((key, .a, fa.variants)) }
                 if let fb { pendingFileDeletes.append((key, .b, fb.variants)) }
+                // It must still be missing where it was missing when this was decided.
+                for side in Side.allCases {
+                    let f = side == .a ? fa : fb
+                    var names: [String] = []
+                    if f == nil { names = [lf.logicalName, pastName] } else if !lone && !Self.hasCurrent(f!) { names = [lf.logicalName] }
+                    for n in names {
+                        mustBeAbsent[key, default: []].append(.init(side: side, parentKey: lf.parentKey, parentRel: lf.parentRel, name: n))
+                    }
+                }
                 continue
             case .keepBoth:
                 guard let fa, let fb else { continue }
@@ -931,9 +1090,10 @@ nonisolated final class SyncEngine: @unchecked Sendable {
                 let wi = versions.firstIndex { v in v.instances.contains { $0.variant == win && $0.side == (decision == .keepA ? .a : .b) } }!
                 let first = versions.remove(at: wi)
                 versions.insert(first, at: 0)
-                if let li = versions.firstIndex(where: { v in v.instances.contains { $0.variant == lose && $0.side == (decision == .keepA ? .b : .a) } }), li > 1 {
+                if let li = versions.firstIndex(where: { v in v.instances.contains { $0.variant == lose && $0.side == (decision == .keepA ? .b : .a) } }), li > 0 {
                     let second = versions.remove(at: li)
-                    versions.insert(second, at: 1)
+                    // The same contents twice: one is enough, so the real previous version stays as _past.
+                    if !sameContent { versions.insert(second, at: 1) }
                 }
                 if versions.count > 1, versions[1].rep.mtime > versions[0].rep.mtime {
                     plan.demote[key] = VersionStamp(size: versions[1].rep.size, mtime: versions[1].rep.mtime)
@@ -947,6 +1107,30 @@ nonisolated final class SyncEngine: @unchecked Sendable {
 
             let group = operations()
             if group.isEmpty { plan.summary.unchanged += 1; continue }
+            if stamp != nil && !sameContent {
+                // Last line of defence: never retire a version that was never synced.
+                let keptPaths = Set(group.flatMap { op in op.slots.map { slot -> String in
+                    switch slot.source {
+                    case .local(let v): return "\(op.side.rawValue)\(v.relPath)"
+                    case .remote(let v): return "\(op.side.other.rawValue)\(v.relPath)"
+                    }
+                } })
+                let lost = group.contains { op in
+                    op.displaced.contains { d in
+                        fresh.contains { v in
+                            v.instances.contains { $0.side == op.side && $0.variant == d }
+                                && !v.instances.contains { keptPaths.contains("\($0.side.rawValue)\($0.variant.relPath)") }
+                        }
+                    }
+                }
+                if lost {
+                    plan.demote[key] = nil
+                    plan.items.removeLast()
+                    plan.summary.conflicts += 1
+                    block("It has more separate edits than name and name_past can hold. Rename one of its files to keep it, then compare again.")
+                    continue
+                }
+            }
             for op in group {
                 for slot in op.slots {
                     guard case .remote(let v) = slot.source else { continue }
@@ -994,9 +1178,9 @@ nonisolated final class SyncEngine: @unchecked Sendable {
 
             let present: Side = here == 1 ? .a : .b
             item.side = present
-            if conflictKeys.contains(key) || underUnreadable(key) {
+            if conflictKeys.contains(key) || insideConflict(key) || leftAlone(key) != nil || underUnreadable(key) {
                 item.kind = .blocked
-                item.reason = conflictKeys.contains(key) ? "A file has the same name as this folder." : "It couldn't be read on one drive."
+                item.reason = leftAlone(key) ?? (underUnreadable(key) ? "It couldn't be read on one drive." : "A file or package has the same name as this folder, or one it is in.")
                 plan.items.append(item)
                 holdsSurvivor.formUnion(Naming.ancestors(of: key))
                 continue
@@ -1050,11 +1234,15 @@ nonisolated final class SyncEngine: @unchecked Sendable {
                 for v in lf.variants { op.expectedFiles[v.relPath] = v }
             }
             op.expectedFolders = Set(scan.folders.keys.filter { $0 == key || $0.hasPrefix(key + "/") })
+            op.group = "d:" + key
+            op.mustBeAbsent = [.init(side: side.other, parentKey: Naming.parent(of: key), parentRel: Naming.parent(of: op.relPath),
+                                     name: Naming.lastComponent(op.relPath))]
             plan.deletes.append(op)
         }
         for d in pendingFileDeletes where !coveredByFolderDelete(d.key, d.side) {
             for v in d.variants {
-                plan.deletes.append(DeleteOp(side: d.side, relPath: v.relPath, isFolder: false, expectedFiles: [v.relPath: v]))
+                plan.deletes.append(DeleteOp(side: d.side, relPath: v.relPath, isFolder: false, expectedFiles: [v.relPath: v],
+                                             group: "f:" + d.key, mustBeAbsent: mustBeAbsent[d.key] ?? []))
             }
         }
         plan.summary.filesToDelete = deletedFileKeys.count
@@ -1072,6 +1260,7 @@ nonisolated final class SyncEngine: @unchecked Sendable {
     /// Everything needed to check, at Apply, that the drives still look the way the user saw them.
     static func review(of plan: SyncPlan) -> Review {
         var r = Review(syncID: plan.oldState?.syncID)
+        for item in plan.items { r.decisions[item.id] = item.suggested }
         let a = plan.scans[0], b = plan.scans[1]
         for key in Set(a.files.keys).union(b.files.keys) { r.fingerprints[key] = Fingerprint.document(a.files[key], b.files[key]) }
         for key in Set(a.folders.keys).union(b.folders.keys) {
@@ -1080,13 +1269,13 @@ nonisolated final class SyncEngine: @unchecked Sendable {
         return r
     }
 
-    private func makeOp(side: Side, file: LogicalFile, logicalName: String, local: [FileVariant], versions: [Version]) -> FileOp? {
+    private func makeOp(side: Side, file: LogicalFile, logicalName: String, local: [FileVariant], versions: [Version], lone: Bool) -> FileOp? {
         var desired: [(VersionRole, Version)] = [(.updated, versions[0])]
-        if versions.count > 1 {
-            desired.append((.past, versions[1]))
-        } else if versions[0].instances.allSatisfy({ $0.variant.role == .past }) {
-            // Only a "_past" file exists (e.g. a document genuinely named "Notes_past.pdf"): leave its name alone.
+        if lone {
+            // Only "_past" files exist (e.g. a document genuinely named "Notes_past.pdf"): leave its name alone.
             desired = [(.past, versions[0])]
+        } else if versions.count > 1 {
+            desired.append((.past, versions[1]))
         }
 
         var used = Set<String>()
@@ -1116,9 +1305,13 @@ nonisolated final class SyncEngine: @unchecked Sendable {
     // MARK: - Execute
 
     func execute(_ plan: SyncPlan) throws -> SyncResult {
+        defer { releaseLocks() }
         var result = SyncResult(completed: false, lastSync: nil, errors: plan.summary.unreadable, copied: 0, bytesCopied: 0, trashed: 0)
-        for side in Side.allCases where !PairStore.isDirectory(root(side).path) {
-            throw SyncError.locationMissing(root(side).path)
+        try ensureRootsAvailable()
+        // Remember "keep the older version" choices before acting on them, so stopping half-way doesn't undo them.
+        if !plan.demote.isEmpty, var early = plan.oldState {
+            early.demoted = (early.demoted ?? [:]).merging(plan.demote) { _, new in new }
+            try writeStates(early)
         }
 
         // Free-space check per destination.
@@ -1242,48 +1435,74 @@ nonisolated final class SyncEngine: @unchecked Sendable {
 
         // 3. Deletions carried over from the other location (to Trash, recoverable)
         setPhase("Removing deleted items…", indeterminate: false)
+        let failures = result.errors - plan.summary.unreadable
+        if failures > 0 && !plan.deletes.isEmpty {
+            log("Nothing was deleted, because something else in this sync failed. Sync again after fixing it.", .warning)
+        }
+        var groups: [[DeleteOp]] = []
         for d in plan.deletes {
+            if let last = groups.last, last[0].group == d.group { groups[groups.count - 1].append(d) } else { groups.append([d]) }
+        }
+        for group in groups where failures == 0 {
             try checkCancel()
-            progress.currentItem = d.relPath
-            if let reason = deletionBlocker(d) {
-                log("\(sideName(d.side)) Kept \(d.relPath) (not moved to Trash): \(reason).", .warning)
-                finishItem()
+            let d0 = group[0]
+            progress.currentItem = d0.relPath
+            try ensureRootsAvailable()
+            var reason = group.lazy.compactMap { self.deletionBlocker($0) }.first
+            for a in d0.mustBeAbsent where reason == nil {
+                let there = url(a.side, parentRel(a.side, parentKey: a.parentKey, fallback: a.parentRel)).appendingPathComponent(a.name)
+                var st = stat()
+                if lstat(there.path, &st) == 0 { reason = "it is back on the other drive" }
+            }
+            if let reason {
+                log("\(sideName(d0.side)) Kept \(d0.relPath) (not moved to Trash): \(reason).", .warning)
+                finishItem(group.count)
                 continue
             }
-            do {
-                try moveToTrash(url(d.side, d.relPath), side: d.side)
-                result.trashed += 1
-                log("\(sideName(d.side)) Moved to Trash \(d.isFolder ? "folder " : "")\(d.relPath) ")
-            } catch {
-                result.errors += 1
-                log("\(sideName(d.side)) Could not remove \(d.relPath): \(error.localizedDescription)", .error)
-                try ensureRootsAvailable()
+            for d in group {
+                do {
+                    try moveToTrash(url(d.side, d.relPath), side: d.side)
+                    result.trashed += 1
+                    log("\(sideName(d.side)) Moved to Trash \(d.isFolder ? "folder " : "")\(d.relPath)")
+                } catch {
+                    result.errors += 1
+                    log("\(sideName(d.side)) Could not remove \(d.relPath): \(error.localizedDescription)", .error)
+                    try ensureRootsAvailable()
+                }
+                finishItem()
             }
-            finishItem()
         }
 
         // 4. Verify, write last-sync record and the file-structure map.
         try checkCancel()
         setPhase("Verifying and writing file map…", indeterminate: true)
+        try ensureRootsAvailable()
         let finalA = try scan(.a), finalB = try scan(.b)
+        try ensureRootsAvailable()
         let now = Date()
         var files: [String: VersionStamp] = [:]
         var demoted: [String: VersionStamp] = [:]
+        var pasts: [String: VersionStamp] = [:]
         var mismatched = 0
         for key in Set(finalA.files.keys).union(finalB.files.keys) {
             // Only a document that really is the same on both drives counts as synced. Anything skipped,
             // failed, or edited during the sync keeps its earlier record, so the next check still sees it.
             if let fa = finalA.files[key], let fb = finalB.files[key],
-               Self.hasCurrent(fa) == Self.hasCurrent(fb), Self.current(fa).sameVersion(as: Self.current(fb)) {
+               finalA.leaveAlone[key] == nil, finalB.leaveAlone[key] == nil,
+               Self.hasCurrent(fa) == Self.hasCurrent(fb), same(Self.current(fa), .a, Self.current(fb), .b) {
                 let ca = Self.current(fa), cb = Self.current(fb)
                 let newest = ca.mtime >= cb.mtime ? ca : cb
                 files[key] = VersionStamp(size: newest.size, mtime: newest.mtime)
-                if let d = plan.demote[key] ?? plan.oldState?.demoted?[key],
+                let pa = Self.past(fa), pb = Self.past(fb)
+                if let pa, let pb, same(pa, .a, pb, .b) { pasts[key] = VersionStamp(size: pa.size, mtime: max(pa.mtime, pb.mtime)) }
+                else if let old = plan.oldState?.pasts?[key] { pasts[key] = old }
+                if let d = plan.demote[key] ?? plan.demoted[key],
                    (fa.variants + fb.variants).contains(where: { $0.role == .past && $0.matches(d) }) { demoted[key] = d }
             } else {
                 mismatched += 1
                 if let old = plan.oldState?.files[key] { files[key] = old }
-                if let old = plan.oldState?.demoted?[key] { demoted[key] = old }
+                if let old = plan.oldState?.pasts?[key] { pasts[key] = old }
+                if let old = plan.demote[key] ?? plan.demoted[key] { demoted[key] = old }
             }
         }
         var folders = Set(finalA.folders.keys).intersection(finalB.folders.keys)
@@ -1294,12 +1513,10 @@ nonisolated final class SyncEngine: @unchecked Sendable {
         }
 
         let state = SyncState(pairID: pair.id, syncID: UUID(), lastSync: now, files: files, folders: folders.sorted(),
-                              demoted: demoted.isEmpty ? nil : demoted)
-        for side in Side.allCases {
-            do { try writeState(state, side) } catch {
-                result.errors += 1
-                log("\(sideName(side)) Could not save the sync record: \(error.localizedDescription)", .error)
-            }
+                              demoted: demoted.isEmpty ? nil : demoted, pasts: pasts)
+        do { try writeStates(state) } catch {
+            result.errors += 1
+            log("Could not save the sync record: \(error.localizedDescription)", .error)
         }
         result.structureFileName = writeStructureFiles(scans: [finalA, finalB], date: now, errors: result.errors)
         result.completed = true
@@ -1378,6 +1595,10 @@ nonisolated final class SyncEngine: @unchecked Sendable {
         for side in Side.allCases where !PairStore.isDirectory(root(side).path) {
             throw SyncError.locationMissing(root(side).path)
         }
+        // An ejected drive can leave an ordinary folder with its name behind.
+        for side in Side.allCases where devices[side.rawValue] != device(side) {
+            throw SyncError.locationMissing(root(side).path)
+        }
     }
 
     /// Make one side hold exactly the planned newest + _past files. Returns how many items went to the Trash.
@@ -1409,14 +1630,30 @@ nonisolated final class SyncEngine: @unchecked Sendable {
             }
         }
         // Retire versions that are no longer the newest or second newest.
+        var retired: [(from: URL, inTrash: URL)] = []
+        func restore() {
+            for r in retired where !fm.fileExists(atPath: r.from.path) { try? fm.moveItem(at: r.inTrash, to: r.from) }
+        }
         for v in op.displaced {
-            try moveToTrash(url(op.side, v.relPath), side: op.side)
+            do {
+                if let t = try moveToTrash(url(op.side, v.relPath), side: op.side) { retired.append((url(op.side, v.relPath), t)) }
+            } catch {
+                restore()
+                throw error
+            }
             trashed += 1
             log("\(sideName(op.side)) Old version to Trash: \(v.relPath)")
         }
+        // If anything below fails, put every name back the way it was.
+        var done: [(from: URL, to: URL)] = []
+        func undo() {
+            for m in done.reversed() where !fm.fileExists(atPath: m.from.path) { try? fm.moveItem(at: m.to, to: m.from) }
+        }
+        do {
         while !moves.isEmpty {
             if let i = moves.firstIndex(where: { !fm.fileExists(atPath: $0.to.path) }) {
                 try fm.moveItem(at: moves[i].from, to: moves[i].to)
+                done.append((moves[i].from, moves[i].to))
                 log("\(sideName(op.side)) \(moves[i].label)")
                 moves.remove(at: i)
             } else if let i = moves.firstIndex(where: { m in moves.contains { sameItem($0.from, m.to) } }),
@@ -1424,6 +1661,7 @@ nonisolated final class SyncEngine: @unchecked Sendable {
                 // Two files swapping names: park one under a recoverable name first.
                 let hold = dir.appendingPathComponent(SyncConstants.holdPrefix + moves[i].from.lastPathComponent)
                 try fm.moveItem(at: moves[i].from, to: hold)
+                done.append((moves[i].from, hold))
                 moves[i].from = hold
             } else {
                 throw SyncError.failed("Couldn't rename versions in \(dirRel.isEmpty ? "the main folder" : dirRel): a name is taken.")
@@ -1434,7 +1672,13 @@ nonisolated final class SyncEngine: @unchecked Sendable {
                 throw SyncError.failed("\"\(p.to.lastPathComponent)\" appeared during the sync; left untouched.")
             }
             try fm.moveItem(at: p.from, to: p.to)
+            done.append((p.from, p.to))
             log("\(sideName(op.side)) \(p.label)")
+        }
+        } catch {
+            undo()
+            restore()
+            throw error
         }
         return trashed
     }
@@ -1459,9 +1703,19 @@ nonisolated final class SyncEngine: @unchecked Sendable {
             throw SyncError.failed("\"\(k.newName)\" already exists, so nothing was done.")
         }
         let original = url(k.loserSide, k.loser.relPath)
-        try fm.moveItem(at: original, to: newOnLose)
-        try fm.moveItem(at: tmpOnLose, to: dir(k.loserSide).appendingPathComponent(k.winner.fileName))
         try fm.moveItem(at: tmpOnWin, to: newOnWin)
+        do {
+            try fm.moveItem(at: original, to: newOnLose)
+            do {
+                try fm.moveItem(at: tmpOnLose, to: dir(k.loserSide).appendingPathComponent(k.winner.fileName))
+            } catch {
+                try? fm.moveItem(at: newOnLose, to: original)
+                throw error
+            }
+        } catch {
+            try? fm.removeItem(at: newOnWin)   // our own copy; the original is back in place
+            throw error
+        }
         result.copied += 2
         result.bytesCopied += k.loser.size + k.winner.size
         log("Kept both: \(k.winner.relPath) and \(k.newName)")
@@ -1472,6 +1726,11 @@ nonisolated final class SyncEngine: @unchecked Sendable {
     /// The file under the plain name, or the newest _past when there is none.
     static func current(_ f: LogicalFile) -> FileVariant {
         f.variants.filter { $0.role == .updated }.max { $0.mtime < $1.mtime } ?? f.variants.max { $0.mtime < $1.mtime }!
+    }
+
+    static func past(_ f: LogicalFile) -> FileVariant? {
+        let c = current(f)
+        return f.variants.filter { $0.role == .past && $0.relPath != c.relPath }.max { $0.mtime < $1.mtime }
     }
 
     /// Byte-for-byte comparison, used only to tell a real clash from the same edit saved twice.
@@ -1488,14 +1747,18 @@ nonisolated final class SyncEngine: @unchecked Sendable {
     /// Tests only: send "trashed" items here instead of the real Trash.
     var trashOverride: URL?
 
-    private func moveToTrash(_ item: URL, side: Side) throws {
+    @discardableResult
+    private func moveToTrash(_ item: URL, side: Side) throws -> URL? {
         do {
             if let t = trashOverride {
                 try fm.createDirectory(at: t, withIntermediateDirectories: true)
-                try fm.moveItem(at: item, to: t.appendingPathComponent(UUID().uuidString + "-" + item.lastPathComponent))
-                return
+                let dest = t.appendingPathComponent(UUID().uuidString + "-" + item.lastPathComponent)
+                try fm.moveItem(at: item, to: dest)
+                return dest
             }
-            try fm.trashItem(at: item, resultingItemURL: nil)
+            var result: NSURL?
+            try fm.trashItem(at: item, resultingItemURL: &result)
+            return result as URL?
         } catch {
             // No Trash on this drive: keep it in a visible, never-synced folder instead of deleting it.
             let bin = root(side).appendingPathComponent(SyncConstants.removedFolderName)
@@ -1510,6 +1773,7 @@ nonisolated final class SyncEngine: @unchecked Sendable {
             }
             try fm.moveItem(at: item, to: dest)
             log("\(sideName(side)) No Trash on this drive; moved to \(SyncConstants.removedFolderName) instead.", .warning)
+            return dest
         }
     }
 
@@ -1542,6 +1806,7 @@ nonisolated final class SyncEngine: @unchecked Sendable {
             }
         }
         _ = copyfile(src.path, dst.path, nil, copyfile_flags_t(COPYFILE_METADATA))
+        Self.unlock(dst)   // a Finder-locked file can't be renamed into place
         copyModificationDate(from: src, to: dst)
     }
 
@@ -1589,6 +1854,7 @@ nonisolated final class SyncEngine: @unchecked Sendable {
         }
         // Best effort: some drives (exFAT, network) can't store every kind of metadata.
         _ = copyfile(src.path, dst.path, nil, copyfile_flags_t(COPYFILE_METADATA))
+        Self.unlock(dst)   // a Finder-locked file can't be renamed into place
         copyModificationDate(from: src, to: dst)
     }
 

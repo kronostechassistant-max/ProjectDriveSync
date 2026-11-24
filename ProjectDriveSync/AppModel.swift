@@ -263,6 +263,7 @@ final class AppModel {
     private func endBusy() {
         isBusy = false
         isComparing = false
+        engine?.releaseLocks()
         engine = nil
         flushLog()
         refreshAvailability(manual: false)

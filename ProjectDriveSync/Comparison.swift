@@ -95,7 +95,7 @@ final class Comparison {
     func decision(_ item: DiffItem) -> Decision { decisions[item.id] ?? item.suggested }
 
     /// A clash with no choice made yet.
-    func isUnchosen(_ item: DiffItem) -> Bool { item.kind == .clash && decisions[item.id] == nil }
+    func isUnchosen(_ item: DiffItem) -> Bool { (item.kind == .clash || item.kind == .olderCopy) && decisions[item.id] == nil }
 
     var hasChoices: Bool { !decisions.isEmpty }
 
@@ -273,6 +273,7 @@ final class Comparison {
         case .deletedButChanged: return "Deleted, but edited"
         case .edited: return "Edited"
         case .clash: return "Edited on both"
+        case .olderCopy: return "Older copy"
         case .onlyHere: return "On one drive only"
         case .differs: return "Different"
         case .tidy: return "_past differs"

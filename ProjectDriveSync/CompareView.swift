@@ -203,7 +203,7 @@ struct CompareView: View {
             Menu {
                 ForEach(item.allowed, id: \.self) { option in
                     Button { comparison.set(option, for: item.id) } label: {
-                        Label(comparison.title(option, item) + (option == item.suggested && item.kind != .clash ? "  (suggested)" : ""),
+                        Label(comparison.title(option, item) + (option == item.suggested && item.kind != .clash && item.kind != .olderCopy ? "  (suggested)" : ""),
                               systemImage: comparison.symbol(option, item))
                     }
                 }
@@ -231,7 +231,7 @@ struct CompareView: View {
         case .added, .onlyHere: return .green
         case .edited, .differs: return .blue
         case .deleted: return .red
-        case .deletedButChanged, .clash, .blocked: return .orange
+        case .deletedButChanged, .clash, .olderCopy, .blocked: return .orange
         }
     }
 
