@@ -5,6 +5,8 @@ setvbuf(stdout, nil, _IONBF, 0)
 let fm = FileManager.default
 let base = URL(fileURLWithPath: CommandLine.arguments[1])
 try? fm.removeItem(at: base)
+// Optional: put location B on another drive, e.g. an exFAT disk image.
+let baseB = CommandLine.arguments.count > 2 ? URL(fileURLWithPath: CommandLine.arguments[2]) : base
 var A = base, B = base, T = base
 var pair: SyncPair!
 var failures = 0, passes = 0
@@ -12,7 +14,7 @@ func check(_ c: Bool, _ m: String) { print((c ? "  PASS " : "  FAIL ") + m); if 
 func fresh(_ n: String) {
     print("== \(n)")
     let r = base.appendingPathComponent(n.replacingOccurrences(of: "/", with: "-"))
-    A = r.appendingPathComponent("A/Proj"); B = r.appendingPathComponent("B/Proj"); T = r.appendingPathComponent("Trash")
+    A = r.appendingPathComponent("A/Proj"); B = baseB.appendingPathComponent("\(n.prefix(3).trimmingCharacters(in: .whitespaces))-B/Proj"); T = r.appendingPathComponent("Trash")
     for d in [A, B, T] { try! fm.createDirectory(at: d, withIntermediateDirectories: true) }
     guard case .success(let p) = PairStore.makePair(pathA: A.path, pathB: B.path, existing: []) else { fatalError() }
     pair = p
@@ -169,10 +171,13 @@ apply(p, ["d:nf": .deleteBoth, "f:nf/x.txt": .deleteBoth]); check(ex(A, "nf/.sec
 fresh("12 unreadable folder: nothing deleted, nothing invented")
 w(A, "d/a.txt", "a", 9000); w(A, "z.txt", "z", 9000); doSync(); rm(B, "z.txt")
 try! fm.setAttributes([.posixPermissions: 0], ofItemAtPath: B.appendingPathComponent("d").path)
+let cantRead = (try? fm.contentsOfDirectory(atPath: B.appendingPathComponent("d").path)) == nil
+if !cantRead { print("  (skipped: this drive has no permissions)") } else {
 p = look(); apply(p, ["f:z.txt": .deleteBoth, "f:d/a.txt": .deleteBoth])
 try! fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: B.appendingPathComponent("d").path)
 check(rd(A, "d/a.txt") == "a" && rd(B, "d/a.txt") == "a" && rd(A, "z.txt") == "z", "nothing deleted while something can't be read")
 check(kind(look(), "f:z.txt") == .deleted, "deletion still remembered")
+}
 
 fresh("13 merge: three different versions are not silently reduced")
 w(A, "r.txt", "A cur", 500); w(A, "r_past.txt", "A past!", 900); w(B, "r.txt", "B cur!!", 400); w(B, "r_past.txt", "B past!!!", 800)
