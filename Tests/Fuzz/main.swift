@@ -37,7 +37,7 @@ func pastName(_ n: String) -> String { Naming.joinPath(Naming.parent(of: n), Nam
 func put(_ d: URL, _ n: String, _ text: String, _ ago: Double) {
     let u = d.appendingPathComponent(n); try? fm.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
     try? text.write(to: u, atomically: false, encoding: .utf8)
-    try? fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -ago)], ofItemAtPath: u.path)
+    try? fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -ago + Double(serial % 20) * 0.05)], ofItemAtPath: u.path)   // never the same instant twice
 }
 func contents(_ d: URL) -> [String: String] {   // relative path -> text
     var o: [String: String] = [:]
