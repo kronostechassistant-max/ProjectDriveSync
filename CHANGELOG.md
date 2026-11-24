@@ -45,6 +45,10 @@ The app only retires a version that its record shows was fully synced on both dr
 - Cancelling a first sync can undo a "use the older version" choice; no version is lost.
 - Deletions are asked about the first time after upgrading from 1.0.
 
+### Made public — 24 November 2026
+- The repository (code, journal and releases) is public, so anyone can download the app and **Check for Updates** works without signing in.
+- Before that, the release file was replaced: debugging information holding folder paths from the Mac that built it was removed, and so was the permission that lets other programs attach to the app. The program code and build number are the same.
+
 ---
 
 ## Version 1.0 (build 1) — 3 November 2026

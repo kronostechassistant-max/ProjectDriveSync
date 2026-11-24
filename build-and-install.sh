@@ -14,7 +14,12 @@ xcodebuild -project ProjectDriveSync.xcodeproj -scheme ProjectDriveSync -configu
   CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM= build | grep -E "error:|BUILD" || true
 APP="$BUILD_DIR/Build/Products/Release/ProjectDriveSync.app"
 [[ -d "$APP" ]] || { echo "Build failed"; exit 1; }
+# Public downloads must not carry this Mac's folder paths or the debugging permission.
+xcrun strip -S "$APP/Contents/MacOS/ProjectDriveSync" 2>/dev/null
+codesign -f -s - --identifier com.kronostechnologies.ProjectDriveSync "$APP" 2>/dev/null
 codesign --verify --deep --strict "$APP"
+if grep -rqaF -e "$HOME/" -e "$BUILD_DIR" "$APP"; then echo "The build contains a folder path from this Mac. Stopped."; exit 1; fi
+if codesign -d --entitlements - "$APP" 2>/dev/null | grep -q get-task-allow; then echo "The build still allows debugging. Stopped."; exit 1; fi
 if [[ "${1:-}" == "--package" ]]; then
   V=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Contents/Info.plist")
   N=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP/Contents/Info.plist")
